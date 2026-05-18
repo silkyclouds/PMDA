@@ -241,6 +241,10 @@ The decision can consider:
 - artwork and tag quality
 - local preferences and rules
 
+When a matched export collides with an already published album folder, PMDA treats that as a high-risk duplicate decision. It only moves a folder automatically when the winner decision is confident. If the existing published folder looks like a preview or has materially fewer tracks than the incoming strict match, the incoming complete edition wins; otherwise ambiguous export collisions are held for review instead of moving a possibly better edition to duplicates.
+
+Provider-ID duplicate groups have an extra title-divergence guard. A shared Discogs/MusicBrainz/Bandcamp/Last.fm ID plus matching track count is not enough to auto-move if album titles clearly identify different volumes or parts, or if same-sized tracklists have no title overlap and strongly divergent album names. Those groups remain visible for human review but are marked no-move.
+
 ### Incomplete handling
 
 PMDA can isolate albums that are incomplete because of:

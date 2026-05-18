@@ -1,18 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { BarChart3, Building2, Disc3, Heart, House, Library, ListMusic, LogOut, Plus, Scan, Settings2, Share2, Shield, Tags, Users, Wrench } from 'lucide-react';
+import { BarChart3, Building2, Disc3, Heart, House, Library, ListMusic, Plus, Scan, Settings2, Share2, Shield, Tags, Users, Wrench, type LucideIcon } from 'lucide-react';
 
 import * as api from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
-import { ThemeToggle } from '@/components/ThemeToggle';
+import { Logo } from '@/components/Logo';
 import {
   Sidebar,
   SidebarContent,
-  SidebarFooter,
   SidebarGroup,
   SidebarGroupAction,
   SidebarGroupContent,
@@ -61,7 +59,7 @@ function parseDropPayload(e: React.DragEvent): { track_id?: number; album_id?: n
 
 export function AppSidebar() {
   const isMobile = useIsMobile();
-  const { user, isAdmin, canViewStatistics, logout } = useAuth();
+  const { isAdmin, canViewStatistics } = useAuth();
   const { toast } = useToast();
   const location = useLocation();
   const navigate = useNavigate();
@@ -71,11 +69,6 @@ export function AppSidebar() {
   const [dragOverPlaylistId, setDragOverPlaylistId] = useState<number | null>(null);
   const [toolsBadgeCount, setToolsBadgeCount] = useState(0);
   const [recommendationsUnreadCount, setRecommendationsUnreadCount] = useState(0);
-  const userInitials = useMemo(() => {
-    const clean = String(user?.username || '').trim();
-    return clean ? clean.slice(0, 2).toUpperCase() : 'U';
-  }, [user?.username]);
-
   const refreshPlaylists = useCallback(async () => {
     try {
       setLoadingPlaylists(true);
@@ -94,22 +87,9 @@ export function AppSidebar() {
       return;
     }
     try {
-      const runs = await api.getScanHistory();
-      const completed = (Array.isArray(runs) ? runs : [])
-        .filter((r) => r.status === 'completed')
-        .sort((a, b) => Number(b.scan_id) - Number(a.scan_id));
-      const latest = completed[0];
-      const dedupeCount = Number(
-        latest?.duplicates_found
-          ?? latest?.duplicate_groups_count
-          ?? latest?.total_duplicates_count
-          ?? 0,
-      );
-      const incompleteCount = Number(
-        latest?.broken_albums_count
-          ?? latest?.summary_json?.broken_albums_count
-          ?? 0,
-      );
+      const stats = await api.getReviewStats();
+      const dedupeCount = Number(stats.duplicates?.groups ?? 0);
+      const incompleteCount = Number(stats.incompletes?.albums ?? 0);
       setToolsBadgeCount(Math.max(0, dedupeCount) + Math.max(0, incompleteCount));
     } catch {
       setToolsBadgeCount(0);
@@ -166,7 +146,7 @@ export function AppSidebar() {
           { to: '/admin/users', label: 'Users', icon: Shield },
         ];
       }
-      const items = [{ to: '/settings', label: 'Settings', icon: Settings2 }];
+      const items: Array<{ to: string; label: string; icon: LucideIcon }> = [];
       if (canViewStatistics) {
         items.unshift({ to: '/statistics', label: 'Statistics', icon: BarChart3 });
       }
@@ -202,16 +182,14 @@ export function AppSidebar() {
     }
   };
 
-  const handleLogout = async () => {
-    await logout();
-    navigate('/auth/login', { replace: true });
-  };
-
   return (
     <Sidebar collapsible="icon" variant="sidebar">
       <SidebarHeader className="pb-1 pt-2">
-        <div className="flex items-center justify-start group-data-[collapsible=icon]:justify-center">
-          <SidebarTrigger className="shrink-0 group-data-[collapsible=icon]:-translate-x-px" />
+        <div className="flex items-center gap-2 px-1 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0">
+          <span className="shrink-0 group-data-[collapsible=icon]:hidden">
+            <Logo variant="wordmark" size="sm" />
+          </span>
+          <SidebarTrigger className="shrink-0 ml-auto group-data-[collapsible=icon]:ml-0" />
         </div>
       </SidebarHeader>
       <SidebarContent className="pt-1">
@@ -367,40 +345,6 @@ export function AppSidebar() {
           </>
         ) : null}
       </SidebarContent>
-
-      <SidebarFooter className="group-data-[collapsible=icon]:items-center">
-        <div className="flex items-center gap-3 px-2 py-2 text-xs text-muted-foreground group-data-[collapsible=icon]:justify-center">
-          <Avatar className="h-10 w-10 rounded-xl border border-border/60 group-data-[collapsible=icon]:h-8 group-data-[collapsible=icon]:w-8">
-            {user?.avatar_data_url ? <AvatarImage src={user.avatar_data_url} alt={user?.username || 'User avatar'} /> : null}
-            <AvatarFallback className="rounded-xl text-xs font-semibold">{userInitials}</AvatarFallback>
-          </Avatar>
-          <div className="min-w-0 group-data-[collapsible=icon]:hidden">
-            <div className="truncate font-medium text-foreground">{user?.username || 'Unknown user'}</div>
-            <div>{isAdmin ? 'Administrator' : 'Library user'}</div>
-          </div>
-        </div>
-        <div className="flex justify-start px-2 pb-2 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0.5">
-          <ThemeToggle
-            showLabel={false}
-            align="start"
-            className="h-9 w-9 group-data-[collapsible=icon]:h-8 group-data-[collapsible=icon]:w-8"
-          />
-        </div>
-        <div className="px-2 pb-2 group-data-[collapsible=icon]:px-0.5 group-data-[collapsible=icon]:pb-1">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="w-full group-data-[collapsible=icon]:h-8 group-data-[collapsible=icon]:w-8 group-data-[collapsible=icon]:px-0"
-            onClick={() => void handleLogout()}
-            aria-label="Logout"
-            title="Logout"
-          >
-            <LogOut className="mr-2 h-3.5 w-3.5 group-data-[collapsible=icon]:mr-0" />
-            <span className="group-data-[collapsible=icon]:hidden">Logout</span>
-          </Button>
-        </div>
-      </SidebarFooter>
 
       <SidebarRail />
     </Sidebar>

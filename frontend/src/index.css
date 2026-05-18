@@ -2,7 +2,7 @@
 @tailwind components;
 @tailwind utilities;
 
-/* PMDA Design System - Teal/Dark Theme with Extended Palette */
+/* PMDA Design System — Warm/Dark Theme with Extended Palette */
 
 @layer base {
   :root {
@@ -15,19 +15,19 @@
     --popover: 0 0% 100%;
     --popover-foreground: 220 30% 10%;
 
-    /* Primary - Teal (Brand) */
-    --primary: 174 72% 40%;
+    /* Primary — Warm Coral (Brand) */
+    --primary: 14 78% 47%;
     --primary-foreground: 0 0% 100%;
 
-    /* Secondary - Slate Blue */
-    --secondary: 234 89% 74%;
+    /* Secondary — Cool Slate Blue */
+    --secondary: 215 25% 55%;
     --secondary-foreground: 0 0% 100%;
 
     --muted: 220 14% 95%;
     --muted-foreground: 220 10% 45%;
 
-    --accent: 174 50% 92%;
-    --accent-foreground: 174 72% 25%;
+    --accent: 14 10% 95%;
+    --accent-foreground: 14 60% 30%;
 
     /* Semantic Colors */
     --destructive: 0 72% 51%;
@@ -44,51 +44,51 @@
 
     --border: 220 13% 88%;
     --input: 220 13% 88%;
-    --ring: 174 72% 40%;
+    --ring: 14 78% 47%;
 
     --radius: 0.4rem;
 
     --sidebar-background: 220 20% 97%;
     --sidebar-foreground: 220 30% 10%;
-    --sidebar-primary: 174 72% 40%;
+    --sidebar-primary: 14 78% 47%;
     --sidebar-primary-foreground: 0 0% 100%;
-    --sidebar-accent: 174 50% 92%;
-    --sidebar-accent-foreground: 174 72% 25%;
+    --sidebar-accent: 14 10% 95%;
+    --sidebar-accent-foreground: 14 60% 30%;
     --sidebar-border: 220 13% 88%;
-    --sidebar-ring: 174 72% 40%;
+    --sidebar-ring: 14 78% 47%;
 
     /* Custom PMDA tokens */
-    --gradient-primary: linear-gradient(135deg, hsl(174 72% 40%), hsl(174 72% 30%));
+    --gradient-primary: linear-gradient(135deg, hsl(14 78% 47%), hsl(14 78% 37%));
     --gradient-card: linear-gradient(180deg, hsl(0 0% 100%), hsl(220 14% 98%));
     --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
     --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
     --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
-    --shadow-glow: 0 0 20px hsl(174 72% 40% / 0.2);
+    --shadow-glow: 0 0 20px hsl(14 78% 47% / 0.15);
   }
 
   .dark {
-    --background: 222 30% 8%;
+    --background: 220 25% 7%;
     --foreground: 210 40% 96%;
 
-    --card: 222 25% 11%;
+    --card: 220 20% 10%;
     --card-foreground: 210 40% 96%;
 
-    --popover: 222 25% 11%;
+    --popover: 220 20% 10%;
     --popover-foreground: 210 40% 96%;
 
-    /* Primary - Teal (Brand) */
-    --primary: 174 72% 45%;
-    --primary-foreground: 222 30% 8%;
+    /* Primary — Warm Coral (Brand) */
+    --primary: 14 78% 57%;
+    --primary-foreground: 0 0% 100%;
 
-    /* Secondary - Slate Blue */
-    --secondary: 234 89% 67%;
+    /* Secondary — Cool Slate Blue */
+    --secondary: 215 25% 50%;
     --secondary-foreground: 0 0% 100%;
 
-    --muted: 222 20% 15%;
-    --muted-foreground: 215 15% 55%;
+    --muted: 220 18% 14%;
+    --muted-foreground: 215 12% 55%;
 
-    --accent: 174 40% 18%;
-    --accent-foreground: 174 72% 65%;
+    --accent: 220 20% 14%;
+    --accent-foreground: 215 15% 70%;
 
     /* Semantic Colors */
     --destructive: 0 62% 45%;
@@ -103,26 +103,26 @@
     --info: 199 89% 55%;
     --info-foreground: 0 0% 100%;
 
-    --border: 222 20% 18%;
-    --input: 222 20% 18%;
-    --ring: 174 72% 45%;
+    --border: 220 15% 16%;
+    --input: 220 15% 16%;
+    --ring: 14 78% 57%;
 
-    --sidebar-background: 222 25% 11%;
+    --sidebar-background: 220 20% 10%;
     --sidebar-foreground: 210 40% 96%;
-    --sidebar-primary: 174 72% 45%;
-    --sidebar-primary-foreground: 222 30% 8%;
-    --sidebar-accent: 174 40% 18%;
-    --sidebar-accent-foreground: 174 72% 65%;
-    --sidebar-border: 222 20% 18%;
-    --sidebar-ring: 174 72% 45%;
+    --sidebar-primary: 14 78% 57%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 220 20% 14%;
+    --sidebar-accent-foreground: 215 15% 70%;
+    --sidebar-border: 220 15% 16%;
+    --sidebar-ring: 14 78% 57%;
 
-    /* Custom PMDA tokens - Dark */
-    --gradient-primary: linear-gradient(135deg, hsl(174 72% 45%), hsl(174 72% 35%));
-    --gradient-card: linear-gradient(180deg, hsl(222 25% 12%), hsl(222 25% 10%));
+    /* Custom PMDA tokens — Dark */
+    --gradient-primary: linear-gradient(135deg, hsl(14 78% 57%), hsl(14 78% 45%));
+    --gradient-card: linear-gradient(180deg, hsl(220 20% 11%), hsl(220 20% 9%));
     --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.3);
     --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.4), 0 2px 4px -2px rgb(0 0 0 / 0.3);
     --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.5), 0 4px 6px -4px rgb(0 0 0 / 0.4);
-    --shadow-glow: 0 0 30px hsl(174 72% 45% / 0.15);
+    --shadow-glow: 0 0 30px hsl(14 78% 57% / 0.12);
   }
 }
 
@@ -216,6 +216,23 @@
     @apply space-y-5 md:space-y-6;
   }
 
+  .scan-page {
+    --scan-bg: 220 30% 4%;
+    --scan-surface: 222 25% 9%;
+    --scan-surface-raised: 222 20% 13%;
+    --scan-border: 222 18% 16%;
+    --scan-border-subtle: 222 15% 12%;
+    --scan-accent: 217 91% 60%;
+    --scan-success: 160 84% 39%;
+    --scan-warning: 38 92% 50%;
+    --scan-error: 0 84% 60%;
+    --scan-purple: 263 85% 67%;
+    --scan-cyan: 188 95% 43%;
+    --scan-text-primary: 0 0% 100%;
+    --scan-text-secondary: 215 20% 69%;
+    --scan-text-tertiary: 215 16% 47%;
+  }
+
   .pmda-page-header {
     @apply flex flex-col gap-3 md:flex-row md:items-start md:justify-between;
   }
@@ -297,8 +314,57 @@
   }
 
   .pmda-hero-panel {
-    @apply border border-white/10 bg-background/58 backdrop-blur-md;
+    @apply border border-border/40 bg-background/58 backdrop-blur-md;
     border-radius: 10px;
+  }
+
+  /* Player bar */
+  .pmda-player-bar {
+    --player-bg: 220 20% 8%;
+    --player-surface: 220 18% 12%;
+    --player-border: 220 15% 16%;
+    --player-text: 210 40% 96%;
+    --player-text-muted: 215 12% 55%;
+    --player-progress: var(--primary);
+    background: hsl(var(--player-bg));
+    color: hsl(var(--player-text));
+    border-color: hsl(var(--player-border));
+  }
+
+  :root .pmda-player-bar {
+    --player-bg: 220 15% 95%;
+    --player-surface: 220 14% 90%;
+    --player-border: 220 13% 85%;
+    --player-text: 220 30% 10%;
+    --player-text-muted: 220 10% 45%;
+  }
+
+  .dark .pmda-player-bar {
+    --player-bg: 220 20% 8%;
+    --player-surface: 220 18% 12%;
+    --player-border: 220 15% 16%;
+    --player-text: 210 40% 96%;
+    --player-text-muted: 215 12% 55%;
+  }
+
+  /* Settings nav — unified muted palette */
+  .pmda-settings-nav-item {
+    @apply flex items-center gap-2 py-2 px-2.5 rounded-lg border border-border/60 text-sm transition-colors;
+    @apply text-muted-foreground hover:text-foreground hover:bg-accent/50 hover:border-border;
+  }
+
+  .pmda-settings-nav-item[data-active="true"] {
+    @apply border-primary/30 text-foreground font-medium;
+    background-color: hsl(var(--primary) / 0.08);
+  }
+
+  .pmda-settings-section-icon {
+    @apply inline-flex h-8 w-8 items-center justify-center rounded-md bg-muted text-muted-foreground;
+  }
+
+  .pmda-settings-nav-item[data-active="true"] .pmda-settings-section-icon {
+    @apply text-primary;
+    background-color: hsl(var(--primary) / 0.15);
   }
 
   .pmda-meta-grid {
@@ -306,15 +372,16 @@
   }
 
   .pmda-meta-cell {
-    @apply border border-white/12 bg-black/26 px-3 py-3;
+    @apply border border-border/40 bg-muted/30 px-3 py-3;
   }
 
-  /* Format badge */
+  /* Format badge identity palette — intentional exemption for file-format recognition */
   .format-badge {
     @apply inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-md;
     @apply bg-muted text-foreground border border-border;
   }
 
+  /* Format badge identity palette — intentional per-format tinting (mirrors badgeStyles.ts exemption) */
   .format-badge-flac {
     @apply border-emerald-300 bg-emerald-100 text-emerald-900 dark:border-emerald-700 dark:bg-emerald-900 dark:text-emerald-100;
   }

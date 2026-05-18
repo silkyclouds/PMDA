@@ -267,7 +267,7 @@ export function SourcesAutonomySettings() {
 
   return (
     <div className="space-y-5">
-      <div className="space-y-4 rounded-xl border border-cyan-500/20 bg-cyan-500/[0.04] p-4">
+      <div className="space-y-4 rounded-xl border border-info/20 bg-info/[0.04] p-4">
         <div className="flex items-center justify-between gap-3">
           <div className="space-y-1">
             <Label className="text-sm">Source folders</Label>
@@ -293,7 +293,7 @@ export function SourcesAutonomySettings() {
         <div className="rounded-lg border border-border/70 bg-background/20 p-3">
           <div className="text-sm font-medium text-foreground">Recommended operating mode</div>
           <p className="mt-1 text-xs text-muted-foreground">
-            Use <span className="text-foreground">Incoming</span> as the drop zone for new music, let PMDA process and place the winner into a <span className="text-foreground">Standard source</span>, then let PMDA export the clean serving tree into your library folder for Plex, Navidrome or Jellyfin.
+            Use <span className="text-foreground">Incoming</span> as the drop zone for new music, let PMDA process and place the winner into a <span className="text-foreground">Standard source</span>, then let PMDA export the clean serving tree into your library folder for Navidrome or Jellyfin.
           </p>
           <p className="mt-2 text-[11px] text-muted-foreground">
             This is optional. You can also skip incoming entirely and scan standard source folders directly.

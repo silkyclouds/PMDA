@@ -8,8 +8,8 @@ import type { ScanProgress as ScanProgressType } from '@/lib/api';
 type LastScanSummary = NonNullable<ScanProgressType['last_scan_summary']>;
 
 export default function Scan() {
-  const { progress: sharedProgress } = useScanProgressShared({ pollInterval: 2500 });
-  const scanProgress = sharedProgress ?? { scanning: false, progress: 0, total: 0, status: 'idle' as const };
+  const { progress: sharedProgress, isLoading: progressLoading, error: progressError } = useScanProgressShared({ pollInterval: 2500 });
+  const scanProgress = sharedProgress ?? null;
   const scanControls = useScanControls();
   const queryClient = useQueryClient();
   const wasScanningRef = useRef(false);
@@ -49,10 +49,10 @@ export default function Scan() {
   }, [scanControls]);
 
   // Enhanced progress with persisted summary
-  const enhancedProgress: ScanProgressType = scanProgress ? {
+  const enhancedProgress: ScanProgressType | null = scanProgress ? {
     ...scanProgress,
     last_scan_summary: persistedSummary ?? scanProgress.last_scan_summary,
-  } : { scanning: false, progress: 0, total: 0, status: 'idle' as const };
+  } : null;
 
   useEffect(() => {
     const backendDefaultRaw = String(scanProgress?.default_scan_type || '').trim().toLowerCase();
@@ -80,14 +80,11 @@ export default function Scan() {
   }, [scanProgress?.scanning, queryClient]);
 
   return (
-    <main className="pmda-page-shell pmda-page-stack">
-      <div>
-        <h1 className="pmda-page-title">Library Scan</h1>
-        <p className="pmda-meta-text mt-1">Run scans, then resolve duplicates and metadata in a clear workflow</p>
-      </div>
-
+    <main className="scan-page pmda-page-shell" data-scan-layout="expanded-v2">
       <ScanProgress
         progress={enhancedProgress}
+        progressLoading={progressLoading}
+        progressError={progressError}
         currentDuplicateCount={currentDuplicateCount}
         onStart={scanControls.start}
         onPause={scanControls.pause}

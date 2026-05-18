@@ -12,6 +12,7 @@ docs/
 !docs/USER_GUIDE.md
 !docs/ARCHITECTURE.md
 !docs/CONFIGURATION.md
+!docs/UNRAID_POWER_SAVER_SCAN.md
 frontend/README.md
 
 # Python
@@ -27,6 +28,12 @@ env/
 # Test / dev only – not for GitHub or production image
 local-test-config/
 scripts/
+!scripts/
+scripts/*
+!scripts/build_with_classical_gate.sh
+!scripts/pipeline_audit_gate.py
+!scripts/legacy_cleanup_gate.py
+!scripts/autonomous_refactor_guard.py
 static/
 frontend/.git
 frontend/node_modules
@@ -35,10 +42,11 @@ frontend/dist
 # Config / state – not needed at runtime (SQLite is source of truth)
 ai_prompt.txt
 config.json
-# state.db
-# cache.db
-# pmda.log
-# pmda.log.*
+state.db
+settings.db
+cache.db
+pmda.log
+pmda.log.*
 
 # IDE / OS
 .idea/

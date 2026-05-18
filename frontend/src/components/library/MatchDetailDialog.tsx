@@ -455,7 +455,7 @@ export function MatchDetailDialog({ open, onOpenChange, entity, onDataChanged }:
                       <div className="text-xs text-muted-foreground">Album description source: n/a</div>
                     )}
                     <div className="text-xs text-muted-foreground">
-                      Auto soft-match AI review: {albumDetail.description?.soft_match_ai_auto_enabled ? 'enabled' : 'disabled'}
+                      Auto soft-match album profile: {albumDetail.description?.soft_match_ai_auto_enabled ? 'enabled' : 'disabled'}
                     </div>
                     {albumDetail.description?.artist_profile_source ? (
                       <ProviderInline label="Artist description source:" provider={albumDetail.description.artist_profile_source} />
@@ -518,10 +518,10 @@ export function MatchDetailDialog({ open, onOpenChange, entity, onDataChanged }:
                                 className={cn(
                                   'h-full transition-all',
                                   attempt.strict
-                                    ? 'bg-emerald-500'
+                                    ? 'bg-success'
                                     : attempt.selected
-                                      ? 'bg-sky-500'
-                                      : 'bg-zinc-400',
+                                      ? 'bg-info'
+                                      : 'bg-muted-foreground/40',
                                 )}
                                 style={{ width: `${Math.max(4, Math.min(100, attempt.score))}%` }}
                               />

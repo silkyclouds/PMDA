@@ -1,6 +1,9 @@
 import tempfile
+import sqlite3
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pmda
 
@@ -9,6 +12,7 @@ class AuthRbacIntegrationTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="pmda-auth-rbac-")
         tmp_path = Path(self._tmp.name)
+        self._tmp_path = tmp_path
 
         self._orig = {
             "CONFIG_DIR": pmda.CONFIG_DIR,
@@ -78,6 +82,48 @@ class AuthRbacIntegrationTests(unittest.TestCase):
         self.assertTrue(payload.get("token"))
         return payload
 
+    def _insert_published_album(self, album_dir: Path | None = None):
+        album_dir = album_dir or (self._tmp_path / "Music_matched" / "Artist" / "Album")
+        album_dir.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(pmda.STATE_DB_FILE)
+        cur = con.cursor()
+        cur.execute(
+            """
+            INSERT INTO files_library_published_albums (
+                folder_path, artist_name, artist_norm, album_title, title_norm,
+                year, genre, label, tags_json, format, is_lossless,
+                has_cover, has_artist_image, mb_identified, strict_match_verified,
+                strict_match_provider, track_count, primary_metadata_source,
+                primary_tags_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(album_dir),
+                "Artist",
+                "artist",
+                "Album",
+                "album",
+                1999,
+                "Ambient",
+                "Warp",
+                '["Ambient"]',
+                "FLAC",
+                1,
+                1,
+                1,
+                1,
+                1,
+                "discogs",
+                9,
+                "discogs",
+                "{}",
+                float(time.time()),
+            ),
+        )
+        con.commit()
+        con.close()
+        return album_dir
+
     def test_bootstrap_login_and_logout_flow(self):
         status_before = self.client.get("/api/auth/bootstrap/status")
         self.assertEqual(status_before.status_code, 200)
@@ -126,6 +172,94 @@ class AuthRbacIntegrationTests(unittest.TestCase):
 
         me_after_logout = self.client.get("/api/auth/me", headers=self._auth_header(token))
         self.assertEqual(me_after_logout.status_code, 401)
+
+    def test_new_install_pipeline_defaults_are_safe(self):
+        auth_payload = self._bootstrap_admin_and_login()
+        token = str(auth_payload["token"])
+
+        resp = self.client.get("/api/config", headers=self._auth_header(token))
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        payload = resp.get_json() or {}
+
+        self.assertTrue(bool(payload.get("PIPELINE_ENABLE_DEDUPE")))
+        self.assertFalse(bool(payload.get("AUTO_MOVE_DUPES")))
+        self.assertFalse(bool(payload.get("PIPELINE_ENABLE_INCOMPLETE_MOVE")))
+
+    def test_authenticated_library_browse_uses_published_snapshot_during_rebuild(self):
+        auth_payload = self._bootstrap_admin_and_login()
+        token = str(auth_payload["token"])
+        album_dir = self._insert_published_album()
+
+        snapshot = {
+            "underbuilt": False,
+            "published_albums": 1,
+            "pg_albums": 25000,
+            "pg_artists": 12000,
+            "index_state": {"running": True, "phase": "parsing"},
+        }
+        with mock.patch.object(pmda, "_get_library_mode", return_value="files"), \
+             mock.patch.object(pmda, "_files_cache_get_json", return_value=None), \
+             mock.patch.object(pmda, "_files_cache_set_json", return_value=None), \
+             mock.patch.object(pmda, "_ensure_files_index_ready", side_effect=AssertionError("live index should not be touched during rebuild")), \
+             mock.patch.object(pmda, "_files_index_maybe_enqueue_published_catchup", return_value=snapshot), \
+             mock.patch.object(pmda, "_files_library_resolve_artist_ids_by_norms", return_value={"artist": 321}), \
+             mock.patch.object(pmda, "_files_library_resolve_album_ids_by_folder_paths", return_value={str(album_dir): 654}):
+            started = time.perf_counter()
+            albums_resp = self.client.get(
+                "/api/library/albums?sort=recent&limit=96&offset=0&include_unmatched=1&scope=library",
+                headers=self._auth_header(token),
+            )
+            artists_resp = self.client.get(
+                "/api/library/artists?sort=recent&limit=96&offset=0&include_unmatched=1&scope=library",
+                headers=self._auth_header(token),
+            )
+            elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(albums_resp.status_code, 200, albums_resp.get_json())
+        self.assertEqual(artists_resp.status_code, 200, artists_resp.get_json())
+        albums_payload = albums_resp.get_json() or {}
+        artists_payload = artists_resp.get_json() or {}
+        self.assertEqual(albums_payload.get("fallback_source"), "published")
+        self.assertEqual(albums_payload.get("browse_source"), "published")
+        self.assertEqual(artists_payload.get("fallback_source"), "published")
+        self.assertEqual(artists_payload.get("browse_source"), "published")
+        self.assertEqual(len(albums_payload.get("albums") or []), 1)
+        self.assertEqual(len(artists_payload.get("artists") or []), 1)
+
+    def test_authenticated_artists_browse_defaults_to_published_snapshot(self):
+        auth_payload = self._bootstrap_admin_and_login()
+        token = str(auth_payload["token"])
+        self._insert_published_album()
+
+        snapshot = {
+            "underbuilt": False,
+            "api_lightweight": True,
+            "published_albums": 1,
+            "published_artists": 1,
+            "pg_albums": 25000,
+            "pg_artists": 12000,
+            "index_state": {"running": False, "phase": "ready"},
+        }
+        with mock.patch.object(pmda, "_get_library_mode", return_value="files"), \
+             mock.patch.object(pmda, "_files_cache_get_json", return_value=None), \
+             mock.patch.object(pmda, "_files_cache_set_json", return_value=None), \
+             mock.patch.object(pmda, "_ensure_files_index_ready", side_effect=AssertionError("artists browse should use published snapshot by default")), \
+             mock.patch.object(pmda, "_files_index_maybe_enqueue_published_catchup", return_value=snapshot), \
+             mock.patch.object(pmda, "_files_library_resolve_artist_ids_by_norms", return_value={"artist": 321}):
+            started = time.perf_counter()
+            artists_resp = self.client.get(
+                "/api/library/artists?sort=recent&limit=96&offset=0&include_unmatched=1&scope=library",
+                headers=self._auth_header(token),
+            )
+            elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(artists_resp.status_code, 200, artists_resp.get_json())
+        payload = artists_resp.get_json() or {}
+        self.assertEqual(payload.get("fallback_source"), "published")
+        self.assertEqual(payload.get("browse_source"), "published")
+        self.assertEqual(len(payload.get("artists") or []), 1)
 
     def test_admin_vs_read_only_rbac_and_download_permission(self):
         admin_auth = self._bootstrap_admin_and_login()
@@ -200,6 +334,123 @@ class AuthRbacIntegrationTests(unittest.TestCase):
 
         reader_statistics_allowed = self.client.get("/api/statistics/cache-control", headers=self._auth_header(reader_token))
         self.assertNotEqual(reader_statistics_allowed.status_code, 403, reader_statistics_allowed.get_json())
+
+    def test_trash_release_curation_endpoints_are_admin_only(self):
+        admin_auth = self._bootstrap_admin_and_login()
+        admin_token = str(admin_auth["token"])
+
+        create_reader = self.client.post(
+            "/api/admin/users",
+            headers=self._auth_header(admin_token),
+            json={
+                "username": "reader_curation",
+                "password": "ReaderPassword123!",
+                "password_confirm": "ReaderPassword123!",
+                "is_admin": False,
+                "can_download": False,
+                "can_view_statistics": False,
+                "is_active": True,
+            },
+        )
+        self.assertEqual(create_reader.status_code, 200, create_reader.get_json())
+
+        reader_login = self.client.post(
+            "/api/auth/login",
+            json={"username": "reader_curation", "password": "ReaderPassword123!"},
+        )
+        self.assertEqual(reader_login.status_code, 200, reader_login.get_json())
+        reader_token = str((reader_login.get_json() or {}).get("token") or "")
+        self.assertTrue(reader_token)
+
+        reader_candidates = self.client.get(
+            "/api/tools/trash-releases",
+            headers=self._auth_header(reader_token),
+        )
+        self.assertEqual(reader_candidates.status_code, 403, reader_candidates.get_json())
+
+        reader_action = self.client.post(
+            "/api/tools/trash-releases/action",
+            headers=self._auth_header(reader_token),
+            json={"album_id": 1, "action": "move_to_dupes"},
+        )
+        self.assertEqual(reader_action.status_code, 403, reader_action.get_json())
+
+    def test_profile_update_persists_user_concert_preferences(self):
+        auth_payload = self._bootstrap_admin_and_login()
+        token = str(auth_payload["token"])
+
+        update = self.client.put(
+            "/api/auth/profile",
+            headers=self._auth_header(token),
+            json={
+                "concerts_filter_enabled": True,
+                "concerts_home_lat": "50.8503",
+                "concerts_home_lon": "4.3517",
+                "concerts_radius_km": "180",
+            },
+        )
+        self.assertEqual(update.status_code, 200, update.get_json())
+        update_user = (update.get_json() or {}).get("user") or {}
+        self.assertTrue(update_user.get("concerts_filter_enabled"))
+        self.assertEqual(update_user.get("concerts_home_lat"), "50.8503")
+        self.assertEqual(update_user.get("concerts_home_lon"), "4.3517")
+        self.assertEqual(update_user.get("concerts_radius_km"), "180")
+
+        me = self.client.get("/api/auth/me", headers=self._auth_header(token))
+        self.assertEqual(me.status_code, 200, me.get_json())
+        persisted_user = (me.get_json() or {}).get("user") or {}
+        self.assertTrue(persisted_user.get("concerts_filter_enabled"))
+        self.assertEqual(persisted_user.get("concerts_home_lat"), "50.8503")
+        self.assertEqual(persisted_user.get("concerts_home_lon"), "4.3517")
+        self.assertEqual(persisted_user.get("concerts_radius_km"), "180")
+
+    def test_admin_ops_endpoints_are_admin_only(self):
+        admin_auth = self._bootstrap_admin_and_login()
+        admin_token = str(admin_auth["token"])
+        self.assertTrue(admin_token)
+
+        create_reader = self.client.post(
+            "/api/admin/users",
+            headers=self._auth_header(admin_token),
+            json={
+                "username": "reader_ops",
+                "password": "ReaderPassword123!",
+                "password_confirm": "ReaderPassword123!",
+                "is_admin": False,
+                "can_download": False,
+                "can_view_statistics": False,
+                "is_active": True,
+            },
+        )
+        self.assertEqual(create_reader.status_code, 200, create_reader.get_json())
+
+        reader_login = self.client.post(
+            "/api/auth/login",
+            json={"username": "reader_ops", "password": "ReaderPassword123!"},
+        )
+        self.assertEqual(reader_login.status_code, 200, reader_login.get_json())
+        reader_token = str((reader_login.get_json() or {}).get("token") or "")
+        self.assertTrue(reader_token)
+
+        snapshot_resp = self.client.get(
+            "/api/admin/ops/snapshot",
+            headers=self._auth_header(reader_token),
+        )
+        self.assertEqual(snapshot_resp.status_code, 403, snapshot_resp.get_json())
+
+        backup_resp = self.client.post(
+            "/api/admin/ops/backup",
+            headers=self._auth_header(reader_token),
+            json={"include_pg_dump": False},
+        )
+        self.assertEqual(backup_resp.status_code, 403, backup_resp.get_json())
+
+        maintenance_resp = self.client.post(
+            "/api/admin/maintenance/reset",
+            headers=self._auth_header(reader_token),
+            json={"actions": ["media_cache"], "restart": False},
+        )
+        self.assertEqual(maintenance_resp.status_code, 403, maintenance_resp.get_json())
 
     def test_admin_can_delete_user_and_cannot_delete_self(self):
         admin_auth = self._bootstrap_admin_and_login()
@@ -310,6 +561,44 @@ class AuthRbacIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(create_without_header.status_code, 401, create_without_header.get_json())
 
+    def test_query_auth_token_only_unlocks_safe_media_get_requests(self):
+        self._bootstrap_admin_and_login()
+
+        login = self.client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "AdminPassword123!", "remember_me": False},
+        )
+        self.assertEqual(login.status_code, 200, login.get_json())
+        token = str((login.get_json() or {}).get("token") or "").strip()
+        self.assertTrue(token)
+
+        fresh_client = pmda.app.test_client()
+        fresh_client.set_cookie(
+            pmda.AUTH_SESSION_COOKIE_NAME,
+            "stale-session-token",
+            domain="localhost",
+        )
+
+        me_with_query = fresh_client.get(f"/api/auth/me?auth_token={token}")
+        self.assertEqual(me_with_query.status_code, 401, me_with_query.get_json())
+
+        library_with_query = fresh_client.get(f"/api/library/track/123/stream?auth_token={token}")
+        self.assertNotEqual(library_with_query.status_code, 401, library_with_query.get_data(as_text=True))
+
+        create_with_query = fresh_client.post(
+            f"/api/admin/users?auth_token={token}",
+            json={
+                "username": "should_still_fail",
+                "password": "ReaderPassword123!",
+                "password_confirm": "ReaderPassword123!",
+                "is_admin": False,
+                "can_download": False,
+                "can_view_statistics": False,
+                "is_active": True,
+            },
+        )
+        self.assertEqual(create_with_query.status_code, 401, create_with_query.get_json())
+
     def test_logout_clears_session_cookie(self):
         self._bootstrap_admin_and_login()
 
@@ -326,6 +615,67 @@ class AuthRbacIntegrationTests(unittest.TestCase):
         set_cookie = logout.headers.get("Set-Cookie") or ""
         self.assertIn(f"{pmda.AUTH_SESSION_COOKIE_NAME}=", set_cookie)
         self.assertIn("Max-Age=0", set_cookie)
+
+    def test_user_can_change_own_password_and_old_sessions_are_revoked(self):
+        auth_payload = self._bootstrap_admin_and_login()
+        token = str(auth_payload.get("token") or "")
+        self.assertTrue(token)
+
+        change = self.client.put(
+            "/api/auth/password",
+            headers=self._auth_header(token),
+            json={
+                "current_password": "AdminPassword123!",
+                "new_password": "AdminPassword456!",
+                "new_password_confirm": "AdminPassword456!",
+            },
+        )
+        self.assertEqual(change.status_code, 200, change.get_json())
+        payload = change.get_json() or {}
+        self.assertTrue(payload.get("ok"))
+        self.assertTrue(payload.get("reauth_required"))
+        set_cookie = change.headers.get("Set-Cookie") or ""
+        self.assertIn(f"{pmda.AUTH_SESSION_COOKIE_NAME}=", set_cookie)
+        self.assertIn("Max-Age=0", set_cookie)
+
+        me_after_change = self.client.get("/api/auth/me", headers=self._auth_header(token))
+        self.assertEqual(me_after_change.status_code, 401, me_after_change.get_json())
+
+        old_login = self.client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "AdminPassword123!"},
+        )
+        self.assertEqual(old_login.status_code, 401, old_login.get_json())
+
+        new_login = self.client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "AdminPassword456!"},
+        )
+        self.assertEqual(new_login.status_code, 200, new_login.get_json())
+
+    def test_password_change_rejects_wrong_current_password(self):
+        auth_payload = self._bootstrap_admin_and_login()
+        token = str(auth_payload.get("token") or "")
+        self.assertTrue(token)
+
+        change = self.client.put(
+            "/api/auth/password",
+            headers=self._auth_header(token),
+            json={
+                "current_password": "WrongPassword123!",
+                "new_password": "AdminPassword456!",
+                "new_password_confirm": "AdminPassword456!",
+            },
+        )
+        self.assertEqual(change.status_code, 401, change.get_json())
+        payload = change.get_json() or {}
+        self.assertEqual(payload.get("error"), "Current password is incorrect")
+
+        unchanged_login = self.client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "AdminPassword123!"},
+        )
+        self.assertEqual(unchanged_login.status_code, 200, unchanged_login.get_json())
 
     def test_non_admin_config_does_not_expose_secrets(self):
         admin_auth = self._bootstrap_admin_and_login()

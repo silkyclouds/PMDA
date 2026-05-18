@@ -1,0 +1,32 @@
+%% PMDA - duplicate detection
+%% Rule: same normalized artist + same normalized album title = one duplicate group
+
+flowchart TB
+  subgraph rule [Single rule]
+    R["Same normalized artist + same normalized album title = one duplicate group"]
+  end
+
+  subgraph ex1 [Example 1: An Eye to Windward]
+    direction LR
+    P1A["Source A: Ochre - An Eye to Windward - folder 1"]
+    P1B["Source B: Ochre - An Eye to Windward - folder 1"]
+    P1A --- P1B
+    M1["Same folder"]
+    P1A --> M1
+    P1B --> M1
+    M1 --> U1["Unduper: shown, run scan - no files to move"]
+  end
+
+  subgraph ex2 [Example 2: Volume I]
+    direction LR
+    P2A["Source A: Ochre - Volume I - folder A"]
+    P2B["Source B: Ochre - Volume I - folder B"]
+    P2A --- P2B
+    M2["Different folders"]
+    P2A --> M2
+    P2B --> M2
+    M2 --> U2["Unduper: dedupe - scan chooses best, losers move to dupes"]
+  end
+
+  R --> ex1
+  R --> ex2

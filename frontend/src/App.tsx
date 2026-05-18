@@ -25,6 +25,7 @@ import Playlists from "./pages/Playlists";
 import PlaylistDetail from "./pages/PlaylistDetail";
 import TagFixer from "./pages/TagFixer";
 import Settings from "./pages/Settings";
+import UserSettings from "./pages/UserSettings";
 import NotFound from "./pages/NotFound";
 import Tools from "./pages/Tools";
 import Unduper from "./pages/Unduper";
@@ -68,22 +69,47 @@ function LoginRedirect() {
 function AuthLoadingScreen() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background p-6">
-      <p className="text-sm text-muted-foreground">Loading authentication…</p>
+      <div className="flex flex-col items-center gap-3">
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+        <p className="text-sm text-foreground/70">Loading authentication…</p>
+      </div>
     </div>
   );
+}
+
+// Preview-only: detect if running inside Lovable preview with ?pmda_preview=shell.
+// Persists to sessionStorage so React Router navigations don't lose the flag.
+const PREVIEW_SESSION_KEY = '__pmda_preview_mode';
+function useLovablePreviewMode(): 'shell' | null {
+  if (typeof window === 'undefined') return null;
+  const isLovablePreview =
+    window.location.hostname.endsWith('.lovableproject.com') ||
+    window.location.hostname.endsWith('.lovable.app');
+  if (!isLovablePreview) return null;
+  // Check URL first (entry point), then sessionStorage (persisted across navigations)
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('pmda_preview') === 'shell') {
+    try { sessionStorage.setItem(PREVIEW_SESSION_KEY, 'shell'); } catch {}
+    return 'shell';
+  }
+  try {
+    if (sessionStorage.getItem(PREVIEW_SESSION_KEY) === 'shell') return 'shell';
+  } catch {}
+  return null;
 }
 
 function AppRoutesWithPlayer() {
   const { session, setCurrentTrack, closePlayer, recommendationSessionId } = usePlayback();
   const auth = useAuth();
   const isMobile = useIsMobile();
+  const previewMode = useLovablePreviewMode();
   useTaskEvents({ enabled: Boolean(auth.user?.is_admin), pollIntervalMs: 3000 });
 
-  if (auth.isLoading) {
+  if (auth.isLoading && !previewMode) {
     return <AuthLoadingScreen />;
   }
 
-  if (auth.bootstrapRequired) {
+  if (!previewMode && auth.bootstrapRequired) {
     return (
       <Routes>
         <Route path="/auth/bootstrap" element={<BootstrapAdminPage />} />
@@ -92,7 +118,7 @@ function AppRoutesWithPlayer() {
     );
   }
 
-  if (!auth.user) {
+  if (!previewMode && !auth.user) {
     return (
       <Routes>
         <Route path="/auth/login" element={<LoginPage />} />
@@ -150,7 +176,8 @@ function AppRoutesWithPlayer() {
             <Route path="/playlists/:playlistId" element={<PlaylistLegacyRedirect />} />
             <Route path="/tag-fixer" element={adminOnly(<TagFixer />)} />
             <Route path="/broken-albums" element={adminOnly(<BrokenAlbumsList />)} />
-            <Route path="/settings" element={<Settings />} />
+            <Route path="/settings" element={auth.isAdmin ? <Settings /> : <Navigate to="/settings/user" replace />} />
+            <Route path="/settings/user" element={<UserSettings />} />
             <Route path="/admin/users" element={adminOnly(<AdminUsersPage />)} />
             <Route path="*" element={<NotFound />} />
           </Route>
@@ -177,7 +204,7 @@ function AppRoutesWithPlayer() {
 }
 
 const App = () => (
-  <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
+  <ThemeProvider attribute="class" defaultTheme="dark" forcedTheme="dark" enableSystem={false} disableTransitionOnChange>
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <Toaster />

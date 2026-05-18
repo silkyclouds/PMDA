@@ -1,8 +1,6 @@
 import { useState, useEffect } from 'react';
-import { Users, Plus, Loader2, Music } from 'lucide-react';
-import { Button } from '@/components/ui/button';
+import { Users, Loader2, Music } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Checkbox } from '@/components/ui/checkbox';
 import { Badge } from '@/components/ui/badge';
 import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { useToast } from '@/hooks/use-toast';
@@ -49,8 +47,6 @@ export function SimilarArtists({ artistId, artistName }: SimilarArtistsProps) {
   const [similarArtists, setSimilarArtists] = useState<SimilarArtist[]>([]);
   const [source, setSource] = useState<string>('');
   const [loading, setLoading] = useState(false);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [adding, setAdding] = useState(false);
   const { toast } = useToast();
 
   const artistKey = (a: SimilarArtist): string => {
@@ -94,62 +90,6 @@ export function SimilarArtists({ artistId, artistName }: SimilarArtistsProps) {
     }
   }, [artistId]);
 
-  const handleToggle = (key: string) => {
-    setSelected(prev => {
-      const next = new Set(prev);
-      if (next.has(key)) {
-        next.delete(key);
-      } else {
-        next.add(key);
-      }
-      return next;
-    });
-  };
-
-  const handleAddSelected = async () => {
-    if (selected.size === 0) return;
-    
-    setAdding(true);
-    try {
-      const artistsToAdd = similarArtists.filter((a) => selected.has(artistKey(a)));
-      
-      // Create Autobrr filter
-      const artistNames = artistsToAdd.map(a => a.name);
-      const response = await fetch('/api/autobrr/create-filter', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          artist_names: artistNames,
-        }),
-      });
-
-      if (response.ok) {
-        const result = await response.json();
-        toast({
-          title: 'Success',
-          description: result.message,
-        });
-        setSelected(new Set());
-      } else {
-        const error = await response.json();
-        throw new Error(error.message || 'Failed to create Autobrr filter');
-      }
-    } catch (error) {
-      toast({
-        title: 'Error',
-        description: error instanceof Error ? error.message : 'Failed to add artists to Autobrr',
-        variant: 'destructive',
-      });
-    } finally {
-      setAdding(false);
-    }
-  };
-
-  const handleAddAll = () => {
-    setSelected(new Set(similarArtists.map((a) => artistKey(a))));
-    handleAddSelected();
-  };
-
   if (loading) {
     return (
       <Card>
@@ -190,35 +130,8 @@ export function SimilarArtists({ artistId, artistName }: SimilarArtistsProps) {
           </div>
           
           <p className="text-xs text-muted-foreground">
-            Add selected artists to Autobrr as a filter for automated monitoring.
+            Similar artists are informational in this build; external automation integrations are disabled.
           </p>
-          
-          <div className="flex items-center gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={handleAddSelected}
-              disabled={selected.size === 0 || adding}
-              className="gap-1.5"
-            >
-              {adding ? (
-                <Loader2 className="w-3 h-3 animate-spin" />
-              ) : (
-                <Plus className="w-3 h-3" />
-              )}
-              Add Selected ({selected.size})
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={handleAddAll}
-              disabled={adding}
-              className="gap-1.5"
-            >
-              <Plus className="w-3 h-3" />
-              Add All
-            </Button>
-          </div>
         </div>
       </CardHeader>
       <CardContent>
@@ -235,19 +148,17 @@ export function SimilarArtists({ artistId, artistName }: SimilarArtistsProps) {
                     alt={artist.name}
                     className="w-full h-full object-cover animate-in fade-in-0 duration-300"
                     loading="lazy"
+                    fallback={(
+                      <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-warning/30 via-muted/10 to-success/30 text-lg font-semibold text-foreground/80">
+                        {initialsFromName(artist.name)}
+                      </div>
+                    )}
                   />
                 ) : (
-                  <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-amber-500/30 via-slate-500/10 to-emerald-500/30 text-lg font-semibold text-foreground/80">
+                  <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-warning/30 via-muted/10 to-success/30 text-lg font-semibold text-foreground/80">
                     {initialsFromName(artist.name)}
                   </div>
                 )}
-                <div className="absolute left-3 top-3">
-                  <Checkbox
-                    checked={selected.has(artistKey(artist))}
-                    onCheckedChange={() => handleToggle(artistKey(artist))}
-                    className="bg-background/85"
-                  />
-                </div>
               </div>
               <div className="space-y-2 p-4">
                 <div className="font-medium leading-tight line-clamp-2 min-h-[2.5rem]">{artist.name}</div>

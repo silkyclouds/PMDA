@@ -25,7 +25,7 @@ PMDA is a self-hosted music matching, cleanup, publishing, and playback platform
 PMDA can be used in two ways:
 
 - as the main music web app
-- as a middleware layer in front of Plex, Jellyfin, or Navidrome
+- as a publisher that can ask Plex, Jellyfin, or Navidrome to refresh after PMDA finishes
 
 In both cases it does the same core work:
 

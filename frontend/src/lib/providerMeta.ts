@@ -1,6 +1,11 @@
 export type ProviderId =
   | 'musicbrainz'
   | 'discogs'
+  | 'itunes'
+  | 'deezer'
+  | 'spotify'
+  | 'qobuz'
+  | 'tidal'
   | 'bandcamp'
   | 'lastfm'
   | 'wikipedia'
@@ -8,7 +13,6 @@ export type ProviderId =
   | 'audiodb'
   | 'fanart'
   | 'bandsintown'
-  | 'searxng'
   | 'serper'
   | 'openai-api'
   | 'openai-codex'
@@ -22,6 +26,11 @@ export type ProviderId =
 export type ProviderIconKey =
   | 'musicbrainz'
   | 'discogs'
+  | 'itunes'
+  | 'deezer'
+  | 'spotify'
+  | 'qobuz'
+  | 'tidal'
   | 'bandcamp'
   | 'lastfm'
   | 'wikipedia'
@@ -29,7 +38,6 @@ export type ProviderIconKey =
   | 'audiodb'
   | 'fanart'
   | 'bandsintown'
-  | 'searxng'
   | 'serper'
   | 'openai'
   | 'anthropic'
@@ -61,6 +69,41 @@ const PROVIDER_META: Record<ProviderId, ProviderMeta> = {
     iconKey: 'discogs',
     aliases: [],
     externalBaseUrl: 'https://discogs.com',
+  },
+  itunes: {
+    id: 'itunes',
+    label: 'iTunes / Apple Music',
+    iconKey: 'itunes',
+    aliases: ['apple music', 'applemusic', 'apple_music', 'apple', 'itune'],
+    externalBaseUrl: 'https://music.apple.com',
+  },
+  deezer: {
+    id: 'deezer',
+    label: 'Deezer',
+    iconKey: 'deezer',
+    aliases: [],
+    externalBaseUrl: 'https://deezer.com',
+  },
+  spotify: {
+    id: 'spotify',
+    label: 'Spotify',
+    iconKey: 'spotify',
+    aliases: ['spotify.com'],
+    externalBaseUrl: 'https://open.spotify.com',
+  },
+  qobuz: {
+    id: 'qobuz',
+    label: 'Qobuz',
+    iconKey: 'qobuz',
+    aliases: [],
+    externalBaseUrl: 'https://www.qobuz.com',
+  },
+  tidal: {
+    id: 'tidal',
+    label: 'TIDAL',
+    iconKey: 'tidal',
+    aliases: [],
+    externalBaseUrl: 'https://tidal.com',
   },
   bandcamp: {
     id: 'bandcamp',
@@ -110,12 +153,6 @@ const PROVIDER_META: Record<ProviderId, ProviderMeta> = {
     iconKey: 'bandsintown',
     aliases: [],
     externalBaseUrl: 'https://bandsintown.com',
-  },
-  searxng: {
-    id: 'searxng',
-    label: 'SearXNG',
-    iconKey: 'searxng',
-    aliases: ['searx', 'searx-ng', 'self-hosted-search'],
   },
   serper: {
     id: 'serper',
@@ -194,12 +231,16 @@ export function normalizeProviderId(raw: string | null | undefined): ProviderId 
   if (value.startsWith('last.fm') || value.startsWith('lastfm')) return 'lastfm';
   if (value.includes('musicbrainz') || value === 'mbid' || value === 'mb') return 'musicbrainz';
   if (value.includes('discogs')) return 'discogs';
+  if (value.includes('apple music') || value.includes('applemusic') || value === 'apple' || value === 'itune' || value.includes('itunes')) return 'itunes';
+  if (value.includes('deezer')) return 'deezer';
+  if (value.includes('spotify')) return 'spotify';
+  if (value.includes('qobuz')) return 'qobuz';
+  if (value.includes('tidal')) return 'tidal';
   if (value.includes('bandcamp')) return 'bandcamp';
   if (value.includes('acoustid') || value.includes('acousticid')) return 'acoustid';
   if (value.includes('fanart')) return 'fanart';
   if (value.includes('audiodb') || value.includes('theaudiodb')) return 'audiodb';
   if (value.includes('bandsintown')) return 'bandsintown';
-  if (value.includes('searxng') || value.includes('searx-ng') || value.includes('searx')) return 'searxng';
   if (value.includes('serper')) return 'serper';
   if (value.includes('ollama')) return 'ollama';
   if (value.includes('anthropic') || value.includes('claude')) return 'anthropic';

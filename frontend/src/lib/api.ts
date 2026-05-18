@@ -1,9 +1,28 @@
 // PMDA API Client
 // Empty = same origin (e.g. when served from the same Docker container). Set VITE_PMDA_API_URL for dev (must be full URL, e.g. http://192.168.3.2:5005).
 const _raw = import.meta.env.VITE_PMDA_API_URL ?? '';
-const API_BASE_URL = typeof _raw === 'string' && (_raw.startsWith('http://') || _raw.startsWith('https://')) ? _raw : '';
+function runtimePmdaBasePath(): string {
+  if (typeof window === 'undefined') return '';
+  const firstSegment = window.location.pathname.split('/').filter(Boolean)[0] || '';
+  return firstSegment.toLowerCase() === 'pmda' ? `/${firstSegment}` : '';
+}
+
+const API_BASE_URL = typeof _raw === 'string' && (_raw.startsWith('http://') || _raw.startsWith('https://'))
+  ? _raw
+  : runtimePmdaBasePath();
 const AUTH_TOKEN_STORAGE_KEY = 'pmda_auth_token';
 const AUTH_TOKEN_SESSION_STORAGE_KEY = 'pmda_auth_token_session';
+
+function withRuntimeApiBase(path: string): string {
+  if (!path.startsWith('/api/')) return path;
+  if (!API_BASE_URL || API_BASE_URL.startsWith('http://') || API_BASE_URL.startsWith('https://')) return path;
+  if (path.startsWith(`${API_BASE_URL}/api/`)) return path;
+  return `${API_BASE_URL}${path}`;
+}
+
+function isRuntimeApiPath(path: string): boolean {
+  return path.startsWith('/api/') || Boolean(API_BASE_URL && API_BASE_URL.startsWith('/') && path.startsWith(`${API_BASE_URL}/api/`));
+}
 
 export function getAuthToken(): string {
   try {
@@ -47,9 +66,21 @@ export function normalizePmdaAssetUrl(value?: string | null): string {
   if (!raw) return '';
   const apiIdx = raw.indexOf('/api/');
   if (apiIdx > 0) {
-    return raw.slice(apiIdx);
+    return withRuntimeApiBase(raw.slice(apiIdx));
   }
-  return raw;
+  return withRuntimeApiBase(raw);
+}
+
+export function appendPmdaAuthToken(value?: string | null): string {
+  const normalized = normalizePmdaAssetUrl(value);
+  if (!normalized || !isRuntimeApiPath(normalized)) return normalized;
+  if (/[?&]auth_token=/.test(normalized)) return normalized;
+  const token = getAuthToken();
+  if (!token) return normalized;
+  const [path, fragment] = normalized.split('#', 2);
+  const separator = path.includes('?') ? '&' : '?';
+  const withToken = `${path}${separator}auth_token=${encodeURIComponent(token)}`;
+  return fragment ? `${withToken}#${fragment}` : withToken;
 }
 
 function normalizePmdaPayloadUrls<T>(value: T): T {
@@ -107,7 +138,13 @@ export function installGlobalAuthFetchInterceptor(): void {
       init?.headers
       ?? (input instanceof Request ? input.headers : undefined);
     const headers = new Headers(withAuthHeaders(inheritedHeaders));
-    return nativeFetch(input, { ...init, headers }).then((response) => {
+    const nextInput =
+      typeof input === 'string' && API_BASE_URL && API_BASE_URL.startsWith('/') && input.startsWith('/api/')
+        ? `${API_BASE_URL}${input}`
+        : input instanceof URL && API_BASE_URL && API_BASE_URL.startsWith('/') && input.pathname.startsWith('/api/')
+          ? new URL(`${API_BASE_URL}${input.pathname}${input.search}${input.hash}`, input.origin)
+          : input;
+    return nativeFetch(nextInput, { ...init, headers }).then((response) => {
       const originalJson = response.json.bind(response);
       (response as Response & { json: typeof response.json }).json = async () => {
         const payload = await originalJson();
@@ -194,6 +231,7 @@ export interface ScanProgress {
     origin_scan_id?: number | null;
     started_at?: number | null;
   }>;
+  mcp?: McpStatusSummary | null;
   profile_backfill?: {
     running?: boolean;
     reason?: string;
@@ -213,18 +251,49 @@ export interface ScanProgress {
   resume_available_by_scan_type?: Partial<Record<'full' | 'changed_only', ScanResumeSnapshot>>;
   scan_type?: 'full' | 'changed_only' | 'incomplete_only';
   scan_resume_run_id?: string | null;
-  /** Current scan phase: pre_scan | preparing_run_scope | format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing | background_enrichment */
-  phase?: 'pre_scan' | 'preparing_run_scope' | 'format_analysis' | 'identification_tags' | 'ia_analysis' | 'finalizing' | 'moving_dupes' | 'post_processing' | 'background_enrichment' | null;
+  /** Current scan phase: pre_scan | preparing_run_scope | format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing | profile_enrichment | background_enrichment */
+  phase?: 'pre_scan' | 'preparing_run_scope' | 'incomplete_move' | 'format_analysis' | 'identification_tags' | 'ia_analysis' | 'moving_dupes' | 'export' | 'post_processing' | 'profile_enrichment' | 'background_enrichment' | 'finalizing' | null;
   /** Micro-step for live indicators: analyzing_format | fetching_mb_id | searching_mb | comparing_versions | detecting_best | done */
   current_step?: string | null;
+  scan_progress_mode?: 'preparing' | 'stage_active' | 'finalizing' | string;
+  scan_eta_confidence?: 'low' | 'medium' | 'high' | string;
+  pipeline_step_human_label?: string | null;
+  current_stage_human_label?: string | null;
   /** Total albums in this scan (for N/M display in findings) */
   total_albums?: number;
   /** AI provider name (e.g. OpenAI) when AI is used */
   ai_provider?: string;
   /** AI model name (e.g. gpt-4o-mini) when AI is used */
   ai_model?: string;
+  /** Per-stage progress counters for the currently active phase. */
+  stage_progress_done?: number;
+  stage_progress_total?: number;
+  stage_progress_percent?: number;
+  stage_progress_unit?: 'steps' | 'roots' | 'albums' | 'artists' | 'groups' | 'jobs' | 'tasks' | string;
+  /** Overall progress counters for the full run, separate from the current stage. */
+  overall_progress_done?: number;
+  overall_progress_total?: number;
+  overall_progress_percent?: number;
+  /** Disk-aware power saver scan telemetry. Present when STORAGE_POWER_SAVER_ENABLED is active. */
+  storage_power_saver_enabled?: boolean;
+  storage_provider?: string;
+  storage_active_devices?: number;
+  storage_devices_total?: number;
+  storage_current_device_id?: string | null;
+  storage_current_device_label?: string | null;
+  storage_bucket_done?: number;
+  storage_bucket_total?: number;
+  storage_buckets_done?: number;
+  storage_buckets_total?: number;
+  storage_estimated_watts_saved?: number;
+  storage_current_bucket?: Record<string, unknown> | null;
+  storage_scan_plan?: Array<Record<string, unknown>>;
+  storage_bucket_history?: Array<Record<string, unknown>>;
+  storage_validation_error?: string;
   // Scan details
   artists_processed?: number;
+  /** Includes in-flight artist buckets so the UI can show real progress before worker commits land. */
+  artists_processed_effective?: number;
   artists_total?: number;
   /** Artists discovered from source before resume/incremental filtering. */
   detected_artists_total?: number;
@@ -262,12 +331,15 @@ export interface ScanProgress {
     current_album?: {
       album_id: number;
       album_title: string;
+      album_index?: number;
+      album_total?: number;
       status: string;
       status_details: string;
       /** Low-level step summary (action). */
       step_summary?: string;
       /** Tool response (FFprobe/MusicBrainz/AI result). */
       step_response?: string;
+      status_updated_at?: number;
     };
   }>;
   /** Albums that completed format (FFprobe) step — for 33% progress during phase duplicates */
@@ -295,6 +367,14 @@ export interface ScanProgress {
   last_scan_summary?: LastScanSummary | null;
   /** Saving results to DB (Unduper + stats); scan not "done" until this is false */
   finalizing?: boolean;
+  scan_finalizing_stage?: string | null;
+  scan_finalizing_label?: string | null;
+  scan_finalizing_done?: number;
+  scan_finalizing_total?: number;
+  scan_finalizing_item_done?: number;
+  scan_finalizing_item_total?: number;
+  scan_finalizing_item_label?: string | null;
+  scan_finalizing_updated_at?: number | null;
   /** Auto-move dupes is enabled (show step 4 when applicable) */
   auto_move_enabled?: boolean;
   /** Currently moving duplicate folders to /dupes */
@@ -318,6 +398,8 @@ export interface ScanProgress {
   post_processing_total?: number;
   post_processing_current_artist?: string | null;
   post_processing_current_album?: string | null;
+  scan_profile_enrich_current_artist?: string | null;
+  scan_profile_enrich_updated_at?: number | null;
   /** Files-mode discovery counters before full artist plan is ready */
   scan_discovery_running?: boolean;
   scan_discovery_current_root?: string | null;
@@ -340,9 +422,31 @@ export interface ScanProgress {
   scan_preplan_total?: number;
   scan_preplan_percent?: number;
   scan_preplan_label?: string | null;
+  scan_prescan_cache_snapshot_running?: boolean;
+  scan_prescan_cache_snapshot_done?: boolean;
+  scan_prescan_cache_snapshot_rows?: number;
+  scan_prescan_cache_snapshot_total?: number;
+  scan_prescan_cache_snapshot_updated_at?: number | null;
+  scan_published_catchup_running?: boolean;
+  scan_published_catchup_reason?: string | null;
+  scan_published_catchup_done?: number;
+  scan_published_catchup_total?: number;
+  scan_published_catchup_ok?: number;
+  scan_published_catchup_failed?: number;
+  scan_published_catchup_current_artist?: string | null;
+  scan_published_catchup_started_at?: number | null;
+  scan_published_catchup_updated_at?: number | null;
+  scan_published_catchup_finished_at?: number | null;
   scan_discogs_matched?: number;
   scan_lastfm_matched?: number;
   scan_bandcamp_matched?: number;
+  provider_matches_so_far?: Partial<Record<string, number>>;
+  scan_provider_stats_live?: Record<string, ProviderGatewayStatsBucket>;
+  matches_so_far?: number;
+  exports_so_far?: number;
+  incomplete_albums_so_far?: number;
+  duplicate_losers_so_far?: number;
+  active_artists_count?: number;
   /** AI guardrail counters for the currently running scan. */
   scan_ai_guard_calls_used?: number;
   scan_ai_guard_calls_blocked?: number;
@@ -366,6 +470,31 @@ export interface ScanProgress {
   scan_incomplete_moved_count?: number;
   /** Total size moved for incompletes (MB) in this scan. */
   scan_incomplete_moved_mb?: number;
+  /** Number of duplicate loser albums/folders auto-moved in this scan. */
+  scan_dupe_moved_count?: number;
+  /** Total size moved for duplicate losers (MB) in this scan. */
+  scan_dupe_moved_mb?: number;
+  scan_incomplete_move_running?: boolean;
+  scan_incomplete_move_done?: number;
+  scan_incomplete_move_total?: number;
+  scan_incomplete_move_current_album?: {
+    artist?: string;
+    album?: string;
+    path?: string;
+  } | null;
+  export_progress?: {
+    running?: boolean;
+    tracks_done?: number;
+    total_tracks?: number;
+    albums_done?: number;
+    total_albums?: number;
+    error?: string | null;
+  } | null;
+  export_running?: boolean;
+  export_albums_done?: number;
+  export_albums_total?: number;
+  export_tracks_done?: number;
+  export_tracks_total?: number;
   /** Tracks detected during pre-scan (filesystem walk). */
   scan_tracks_detected_total?: number;
   /** Tracks currently kept in live library index (files_tracks). */
@@ -378,6 +507,8 @@ export interface ScanProgress {
   scan_tracks_unaccounted?: number;
   /** Albums whose per-artist scan worker completed successfully during this run. */
   scan_processed_albums_count?: number;
+  /** Includes in-flight album progress from active artist workers. */
+  scan_processed_albums_effective?: number;
   /** Albums already published into the live Files library during this run. */
   scan_published_albums_count?: number;
   /** Raw rows written to the publication table before browse/index filtering settles. */
@@ -528,6 +659,19 @@ export interface CacheControlMetrics {
 export interface LogTailResponse {
   path: string;
   lines: string[];
+  entries?: LogTailEntry[];
+}
+
+export interface LogTailEntry {
+  raw: string;
+  timestamp: string;
+  level: string;
+  thread: string;
+  thread_key: string;
+  thread_slot: number;
+  message: string;
+  kind: string;
+  marker: string;
 }
 
 export interface LastScanSummary {
@@ -563,11 +707,25 @@ export interface LastScanSummary {
   strict_total_albums?: number;
   strict_matched_albums?: number;
   strict_unmatched_albums?: number;
+  strict_provider_counts?: Record<string, number>;
+  strict_provider_total?: number;
+  musicbrainz_identity_hits?: number;
+  musicbrainz_identity_verified?: number;
+  musicbrainz_strict_wins?: number;
+  musicbrainz_identity_non_wins?: number;
+  musicbrainz_ids_captured?: number;
+  musicbrainz_outcome_counts?: Record<string, number>;
+  musicbrainz_non_win_by_winner?: Record<string, number>;
+  musicbrainz_non_win_by_reason?: Record<string, number>;
   albums_with_mb_id?: number;
   /** When auto-move ran this scan: number of duplicate albums moved. */
   dupes_moved_this_scan?: number;
   /** When auto-move ran this scan: MB reclaimed. */
   space_saved_mb_this_scan?: number;
+  /** When auto-move incompletes ran this scan: number of incomplete albums moved. */
+  incomplete_moved_this_scan?: number;
+  /** When auto-move incompletes ran this scan: MB moved. */
+  incomplete_moved_mb_this_scan?: number;
   /** Match stats per source (chart-ready): matched / total */
   mb_match?: { matched: number; total: number };
   discogs_match?: { matched: number; total: number };
@@ -636,7 +794,7 @@ export interface Edition {
 export interface DuplicateDetails {
   artist: string;
   album: string;
-  /** Plex rating key of the artist (for "Open in Plex" → artist page) */
+  /** Backend artist identifier. */
   artist_id?: number;
   editions: Edition[];
   rationale: string;
@@ -662,14 +820,6 @@ export interface DedupeResult {
 }
 
 export interface PMDAConfig {
-  // Plex
-  PLEX_HOST: string;
-  PLEX_TOKEN: string;
-  PLEX_BASE_PATH?: string;
-  PLEX_DB_PATH: string;
-  PLEX_DB_FILE: string;
-  SECTION_IDS: string;
-  
   // Paths
   PATH_MAP: Record<string, string>;
   DUPE_ROOT: string;
@@ -680,7 +830,7 @@ export interface PMDAConfig {
   /** RW status for music folder(s) and dupes folder (from backend) */
   paths_status?: { music_rw: boolean; dupes_rw: boolean };
   /** Container mounts status for fresh-config welcome message */
-  container_mounts?: { config_rw: boolean; plex_db_ro: boolean; music_rw: boolean; dupes_rw: boolean };
+  container_mounts?: { config_rw: boolean; music_rw: boolean; dupes_rw: boolean };
   
   // Scan
   SCAN_THREADS: number | 'auto';
@@ -694,12 +844,46 @@ export interface PMDAConfig {
   /** When true, treat album titles like "Lemodie (Flac)" and "Lemodie" as the same for duplicate detection (strip format/version in parentheses). */
   NORMALIZE_PARENTHETICAL_FOR_DEDUPE?: boolean;
   FORMAT_PREFERENCE: string[];
-  /** Library backend mode: plex (default) or files. */
-  LIBRARY_MODE?: 'plex' | 'files';
+  /** Strict provider identity matching (stronger gates when matching). */
+  PROVIDER_IDENTITY_STRICT?: boolean;
+  /** Allow AI assistance during provider identity arbitration. */
+  PROVIDER_IDENTITY_USE_AI?: boolean;
+  /** Minimum identity score to accept provider match. */
+  PROVIDER_IDENTITY_MIN_SCORE?: number;
+  /** Score margin required over next-best provider candidate. */
+  PROVIDER_IDENTITY_SCORE_MARGIN?: number;
+  /** Library backend mode. Current PMDA builds are files-only. */
+  LIBRARY_MODE?: 'files';
   /** Include albums not formally matched by PMDA in library views. */
   LIBRARY_INCLUDE_UNMATCHED?: boolean;
   /** File-library roots (comma-separated string in UI). */
   FILES_ROOTS?: string;
+  /** Guided library workflow mode. */
+  LIBRARY_WORKFLOW_MODE?: 'managed' | 'mirror' | 'inplace' | 'custom' | 'audit';
+  /** Tag writing policy for files (full writes or PMDA ID only). */
+  FILES_TAG_WRITE_MODE?: 'full' | 'pmda_id_only';
+  /** Clean serving library root for the guided workflow. */
+  LIBRARY_SERVING_ROOT?: string;
+  /** Intake folders used by managed / in-place workflows. */
+  LIBRARY_INTAKE_ROOTS?: string;
+  /** Source library folders used by mirror / in-place workflows. */
+  LIBRARY_SOURCE_ROOTS?: string;
+  /** Guided duplicate quarantine root. */
+  LIBRARY_DUPES_ROOT?: string;
+  /** Guided incomplete quarantine root. */
+  LIBRARY_INCOMPLETE_ROOT?: string;
+  /** Guided materialization policy for library promotion. */
+  LIBRARY_MATERIALIZATION_MODE?: 'hardlink' | 'symlink' | 'copy' | 'move';
+  /** Guided folder naming toggle for detected format. */
+  LIBRARY_INCLUDE_FORMAT_IN_FOLDER?: boolean;
+  /** Guided folder naming toggle for album type. */
+  LIBRARY_INCLUDE_TYPE_IN_FOLDER?: boolean;
+  /** Derived helper flags from backend. */
+  LIBRARY_HAS_INTAKE?: boolean;
+  LIBRARY_VISIBLE_SCOPES?: LibraryBrowseScope[] | string;
+  LIBRARY_EFFECTIVE_SCAN_ROOTS?: string;
+  LIBRARY_EFFECTIVE_LIBRARY_ROOTS?: string;
+  LIBRARY_EFFECTIVE_INBOX_ROOTS?: string;
   /** Canonical winner source root id for dedupe winner placement. */
   WINNER_SOURCE_ROOT_ID?: string;
   /** Winner placement strategy for canonical root normalization. */
@@ -710,6 +894,10 @@ export interface PMDAConfig {
   EXPORT_NAMING_TEMPLATE?: string;
   /** Link strategy for export: hardlink | symlink | copy | move. */
   EXPORT_LINK_STRATEGY?: 'hardlink' | 'symlink' | 'copy' | 'move';
+  /** Include the detected album format in the exported album folder name. */
+  EXPORT_INCLUDE_ALBUM_FORMAT_IN_FOLDER?: boolean;
+  /** Include the detected album type (Album/EP/Single/Compilation/Live) in the exported album folder name. */
+  EXPORT_INCLUDE_ALBUM_TYPE_IN_FOLDER?: boolean;
   /** NVMe-friendly media cache root for pre-rendered artwork thumbnails (album/artist). */
   MEDIA_CACHE_ROOT?: string;
   /** In-process RAM cache budget for artwork bytes (MB). 0 disables RAM artwork cache. */
@@ -726,6 +914,16 @@ export interface PMDAConfig {
   ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC?: number;
   /** When true (Files mode), rebuild the export library automatically after a Magic scan. */
   AUTO_EXPORT_LIBRARY?: boolean;
+  /** Local stdio MCP agent access. Off by default; MCP tokens are invalid while disabled. */
+  MCP_ENABLED?: boolean;
+  /** Unraid disk-aware scan mode. Reads from /host_mnt/diskN while keeping canonical /music paths. */
+  STORAGE_POWER_SAVER_ENABLED?: boolean;
+  STORAGE_PROVIDER?: 'unraid' | string;
+  UNRAID_HOST_MNT_ROOT?: string;
+  UNRAID_USER_SHARE_HOST_ROOT?: string;
+  UNRAID_CONTAINER_SHARE_ROOT?: string;
+  STORAGE_MAX_ACTIVE_DEVICES?: number;
+  STORAGE_SPINDOWN_POLICY?: 'none' | string;
   
   // AI Provider
   AI_PROVIDER: 'openai' | 'openai-api' | 'openai-codex' | 'anthropic' | 'google' | 'ollama';
@@ -760,6 +958,7 @@ export interface PMDAConfig {
   OLLAMA_URL: string;
   OLLAMA_MODEL?: string;
   OLLAMA_COMPLEX_MODEL?: string;
+  OLLAMA_RUNTIME_MODE?: 'managed' | 'adopted' | 'external' | 'absent' | string;
   SCAN_AI_LOCAL_BULK_MODEL?: string;
   SCAN_AI_LOCAL_HARD_MODEL?: string;
   SCAN_AI_LOCAL_HARD_AVAILABLE?: boolean;
@@ -768,6 +967,11 @@ export interface PMDAConfig {
   
   // MusicBrainz & Notifications
   USE_MUSICBRAINZ: boolean;
+  USE_ITUNES?: boolean;
+  USE_DEEZER?: boolean;
+  USE_SPOTIFY?: boolean;
+  USE_QOBUZ?: boolean;
+  USE_TIDAL?: boolean;
   MUSICBRAINZ_EMAIL: string;
   /** How to apply MusicBrainz artist credits to tags and grouping. */
   ARTIST_CREDIT_MODE?: 'album_artist_strict' | 'musicbrainz_full_credit' | 'picard_like_default';
@@ -783,6 +987,73 @@ export interface PMDAConfig {
   USE_AI_FOR_MB_VERIFY?: boolean;
   /** Use AI arbitration for ambiguous duplicate groups. */
   USE_AI_FOR_DEDUPE?: boolean;
+  /** Route MusicBrainz lookups to a local/private mirror. */
+  MUSICBRAINZ_MIRROR_ENABLED?: boolean;
+  /** Base URL of the local/private MusicBrainz mirror. */
+  MUSICBRAINZ_BASE_URL?: string;
+  /** Friendly name displayed in the UI for the MusicBrainz mirror. */
+  MUSICBRAINZ_MIRROR_NAME?: string;
+  /** Runtime management mode for the local MusicBrainz mirror. */
+  MUSICBRAINZ_RUNTIME_MODE?: 'managed' | 'adopted' | 'external' | 'absent' | string;
+  /** Optional MetaBrainz replication token used by managed local mirrors. */
+  MUSICBRAINZ_REPLICATION_TOKEN?: string;
+  MUSICBRAINZ_REPLICATION_TOKEN_SET?: boolean;
+  /** Public MusicBrainz queue rate limit in requests/sec. */
+  MB_PUBLIC_QUEUE_RPS?: number;
+  /** Local MusicBrainz mirror queue rate limit in requests/sec. */
+  MB_MIRROR_QUEUE_RPS?: number;
+  /** Effective MusicBrainz endpoint after applying mirror settings. */
+  MUSICBRAINZ_EFFECTIVE_BASE_URL?: string;
+  /** Shared roots for managed local runtime provisioning. */
+  MANAGED_RUNTIME_CONFIG_ROOT?: string;
+  MANAGED_RUNTIME_DATA_ROOT?: string;
+  MANAGED_MUSICBRAINZ_INSTALL_ROOT?: string;
+  MANAGED_MUSICBRAINZ_UPDATE_ENABLED?: boolean;
+  MANAGED_MUSICBRAINZ_REINDEX_INTERVAL_HOURS?: number;
+  /** Enable the shared provider gateway with cache and throttling. */
+  PROVIDER_GATEWAY_ENABLED?: boolean;
+  /** Enable shared provider gateway response caching. */
+  PROVIDER_GATEWAY_CACHE_ENABLED?: boolean;
+  /** Maximum simultaneous provider requests through the gateway. */
+  PROVIDER_GATEWAY_MAX_INFLIGHT?: number;
+  /** Shared Discogs request budget per minute. */
+  PROVIDER_GATEWAY_DISCOGS_RPM?: number;
+  /** Shared iTunes / Apple Music request budget per minute. */
+  PROVIDER_GATEWAY_ITUNES_RPM?: number;
+  /** Shared Deezer request budget per minute. */
+  PROVIDER_GATEWAY_DEEZER_RPM?: number;
+  /** Shared Spotify request budget per minute. */
+  PROVIDER_GATEWAY_SPOTIFY_RPM?: number;
+  /** Shared Qobuz request budget per minute. */
+  PROVIDER_GATEWAY_QOBUZ_RPM?: number;
+  /** Shared TIDAL request budget per minute. */
+  PROVIDER_GATEWAY_TIDAL_RPM?: number;
+  /** Shared Last.fm request budget per minute. */
+  PROVIDER_GATEWAY_LASTFM_RPM?: number;
+  /** Shared TheAudioDB request budget per minute. */
+  PROVIDER_GATEWAY_AUDIODB_RPM?: number;
+  /** Shared Bandcamp request budget per minute. */
+  PROVIDER_GATEWAY_BANDCAMP_RPM?: number;
+  /** Enable runtime auto-tuning for local MB mirror and gateway concurrency. */
+  AUTO_TUNE_ENABLED?: boolean;
+  /** Seconds between auto-tune passes. */
+  AUTO_TUNE_INTERVAL_SEC?: number;
+  /** Lower bound for MB mirror requests/sec. */
+  AUTO_TUNE_MB_MIRROR_MIN_RPS?: number;
+  /** Upper bound for MB mirror requests/sec. */
+  AUTO_TUNE_MB_MIRROR_MAX_RPS?: number;
+  /** Lower bound for provider gateway in-flight requests. */
+  AUTO_TUNE_PROVIDER_MAX_INFLIGHT_MIN?: number;
+  /** Upper bound for provider gateway in-flight requests. */
+  AUTO_TUNE_PROVIDER_MAX_INFLIGHT_CAP?: number;
+  /** Enable persisted metadata jobs for hybrid/offloaded metadata processing. */
+  METADATA_QUEUE_ENABLED?: boolean;
+  /** Metadata worker topology. */
+  METADATA_WORKER_MODE?: 'local' | 'hybrid';
+  /** Number of metadata workers. */
+  METADATA_WORKER_COUNT?: number;
+  /** Number of metadata jobs to pull per batch. */
+  METADATA_JOB_BATCH_SIZE?: number;
   /** When enabled, PMDA can auto-generate album reviews/descriptions for SOFT_MATCH albums. */
   USE_AI_FOR_SOFT_MATCH_PROFILES?: boolean;
   /** After AI text match, compare local cover to Cover Art Archive (vision). Reject match if "No". */
@@ -812,7 +1083,7 @@ export interface PMDAConfig {
   /** When no MB candidate or AI says NONE, use web search (Serper) + AI to suggest MBID. */
   USE_WEB_SEARCH_FOR_MB?: boolean;
   /** Which web search backend PMDA should use before any paid fallback. */
-  WEB_SEARCH_PROVIDER?: 'auto' | 'searxng' | 'serper' | 'ai_only' | 'disabled';
+  WEB_SEARCH_PROVIDER?: 'auto' | 'serper' | 'ollama' | 'ai_only' | 'disabled';
   /** When Serper is unavailable (missing key/no credits), fallback to OpenAI native web search tool. */
   USE_AI_WEB_SEARCH_FALLBACK?: boolean;
   /** Hard cap for total AI calls per scan (0 = disable AI calls during scan). */
@@ -821,9 +1092,6 @@ export interface PMDAConfig {
   AI_CALL_COOLDOWN_SEC?: number;
   /** Serper.dev API key for web search. */
   SERPER_API_KEY?: string;
-  /** Local/self-hosted SearXNG base URL. */
-  SEARXNG_URL?: string;
-  SEARXNG_URL_SET?: boolean;
   // Metadata Providers
   USE_DISCOGS: boolean;
   DISCOGS_USER_TOKEN: string;
@@ -839,6 +1107,9 @@ export interface PMDAConfig {
   LASTFM_SCROBBLE_PENDING?: boolean;
   /** fanart.tv API key (optional). Used for additional artist artwork (MBID-based). */
   FANART_API_KEY?: string;
+  /** TheAudioDB API key (optional). Used for album cover fallback and artist images. */
+  THEAUDIODB_API_KEY?: string;
+  THEAUDIODB_API_KEY_SET?: boolean;
   USE_BANDCAMP: boolean;
   /** Skip MusicBrainz lookup and tagging for albums detected as live (folder/title heuristics). */
   SKIP_MB_FOR_LIVE_ALBUMS?: boolean;
@@ -868,6 +1139,8 @@ export interface PMDAConfig {
   PIPELINE_ENABLE_EXPORT?: boolean;
   PIPELINE_ENABLE_PLAYER_SYNC?: boolean;
   PIPELINE_PLAYER_TARGET?: 'none' | 'plex' | 'jellyfin' | 'navidrome';
+  LIDARR_FEATURE_ENABLED?: boolean;
+  AUTOBRR_FEATURE_ENABLED?: boolean;
   PIPELINE_POST_SCAN_ASYNC?: boolean;
   TASK_NOTIFICATIONS_ENABLED?: boolean;
   TASK_NOTIFICATIONS_SUCCESS?: boolean;
@@ -884,11 +1157,6 @@ export interface PMDAConfig {
   SCHEDULER_PAUSED?: boolean;
   /** Allow scheduler to run non-scan jobs (enrich/dedupe/export/player-sync) outside scan post-chain. */
   SCHEDULER_ALLOW_NON_SCAN_JOBS?: boolean;
-  // Integrations
-  LIDARR_URL: string;
-  LIDARR_API_KEY: string;
-  AUTOBRR_URL: string;
-  AUTOBRR_API_KEY: string;
   AUTO_FIX_BROKEN_ALBUMS: boolean;
   // Broken album detection thresholds
   BROKEN_ALBUM_CONSECUTIVE_THRESHOLD: number;
@@ -896,6 +1164,9 @@ export interface PMDAConfig {
   // Incomplete album definition
   REQUIRED_TAGS: string[];
   // Player integrations
+  PLEX_HOST?: string;
+  PLEX_TOKEN?: string;
+  PLEX_TOKEN_SET?: boolean;
   JELLYFIN_URL?: string;
   JELLYFIN_API_KEY?: string;
   NAVIDROME_URL?: string;
@@ -931,7 +1202,8 @@ export type TaskJobType =
   | 'dedupe'
   | 'incomplete_move'
   | 'export'
-  | 'player_sync';
+  | 'player_sync'
+  | 'managed_musicbrainz_update';
 
 export type TaskScope = 'new' | 'full' | 'both';
 export type TaskEventStatus = 'started' | 'completed' | 'failed' | 'skipped';
@@ -1117,6 +1389,16 @@ export interface ScanHistorySummaryJson {
   strict_total_albums?: number;
   strict_matched_albums?: number;
   strict_unmatched_albums?: number;
+  strict_provider_counts?: Record<string, number>;
+  strict_provider_total?: number;
+  musicbrainz_identity_hits?: number;
+  musicbrainz_identity_verified?: number;
+  musicbrainz_strict_wins?: number;
+  musicbrainz_identity_non_wins?: number;
+  musicbrainz_ids_captured?: number;
+  musicbrainz_outcome_counts?: Record<string, number>;
+  musicbrainz_non_win_by_winner?: Record<string, number>;
+  musicbrainz_non_win_by_reason?: Record<string, number>;
   albums_with_mb_id?: number;
   dupes_moved_this_scan?: number;
   space_saved_mb_this_scan?: number;
@@ -1142,6 +1424,15 @@ export interface ScanHistorySummaryJson {
   pmda_albums_complete?: number;
   pmda_albums_with_cover?: number;
   pmda_albums_with_artist_image?: number;
+  provider_no_tracklist?: {
+    total?: number;
+    by_provider?: Record<string, number>;
+    by_cause?: Record<string, number>;
+    details_by_provider?: Record<string, Record<string, number>>;
+  };
+  provider_no_tracklist_total?: number;
+  provider_no_tracklist_by_provider?: Record<string, number>;
+  provider_no_tracklist_by_cause?: Record<string, number>;
 }
 
 export type AICostGroupBy = 'analysis_type' | 'job_type' | 'model' | 'provider' | 'album' | 'auth_mode';
@@ -1189,6 +1480,21 @@ export interface ScanAICostSummary {
   last_updated_at?: number | null;
 }
 
+export interface ProviderSourceBucket {
+  total: number;
+  providers: Record<string, number>;
+}
+
+export interface EnrichmentSourcesResponse {
+  available: boolean;
+  reason?: string;
+  overall: ProviderSourceBucket;
+  album_profiles: ProviderSourceBucket;
+  artist_profiles: ProviderSourceBucket;
+  artist_images: ProviderSourceBucket;
+  label_logos: ProviderSourceBucket;
+}
+
 export interface BenchmarkCheckResult {
   name: string;
   pass: boolean;
@@ -1214,6 +1520,324 @@ export interface BenchmarkReportsResponse {
   available: boolean;
   path: string;
   reports: BenchmarkReportSummary[];
+}
+
+export interface AIDomainBenchmarkSummary {
+  file: string;
+  generated_at: number;
+  available: boolean;
+  note?: string;
+  sample_size?: number;
+  baseline_score?: number | null;
+  assisted_score?: number | null;
+  delta?: number | null;
+  ai_completed?: number;
+  ai_skipped?: number;
+  ai_failed?: number;
+  avg_latency_sec?: number | null;
+}
+
+export interface AIQueueStatus {
+  domain: 'matching' | 'dedupe' | 'incomplete' | 'review' | string;
+  running: boolean;
+  waiting_for_idle_scan?: boolean;
+  queued: number;
+  worker_started?: boolean;
+  current_label?: string;
+  current_model?: string;
+  last_status?: string;
+  last_error?: string;
+  last_started_at?: number;
+  last_finished_at?: number;
+  last_latency_ms?: number;
+  avg_latency_ms?: number;
+  completed_count?: number;
+  failed_count?: number;
+  skipped_count?: number;
+  last_result?: Record<string, unknown>;
+}
+
+export interface AIDomainOverview {
+  domain: 'matching' | 'dedupe' | 'incomplete' | 'review' | string;
+  analysis_types: string[];
+  calls_total: number;
+  completed: number;
+  failed: number;
+  skipped: number;
+  avg_latency_ms?: number | null;
+  cache_hits: number;
+  cache_hit_rate?: number | null;
+  last_call_at?: number | null;
+  override_count: number;
+  override_rate?: number | null;
+  last_override_at?: number | null;
+  queue?: AIQueueStatus | null;
+  benchmark?: AIDomainBenchmarkSummary | null;
+}
+
+export interface AIOverviewResponse {
+  generated_at: number;
+  analysis_dir: string;
+  queues: Record<string, AIQueueStatus>;
+  domains: AIDomainOverview[];
+}
+
+export interface ProviderGatewayStatsBucket {
+  rpm_limit: number;
+  request_count: number;
+  network_request_count: number;
+  cache_hits: number;
+  negative_cache_hits?: number;
+  error_cache_hits?: number;
+  coalesced_waits?: number;
+  lookup_request_count?: number;
+  lookup_network_request_count?: number;
+  lookup_saved_count?: number;
+  lookup_cache_hits?: number;
+  lookup_negative_hits?: number;
+  lookup_error_hits?: number;
+  lookup_coalesced_waits?: number;
+  lookup_hit_rate?: number;
+  lookup_saved_rate?: number;
+  lookup_cache_resolution_rate?: number;
+  avg_network_requests_per_lookup?: number;
+  cache_hit_rate: number;
+  rate_limited_count: number;
+  failure_count: number;
+  timeout_count: number;
+  avg_latency_ms: number;
+  last_status?: number | null;
+  last_error?: string;
+  last_context?: string;
+  last_request_at?: number | null;
+}
+
+export type ManagedRuntimeBundleType = 'musicbrainz_local' | 'ollama_local';
+
+export interface ManagedRuntimeHealth {
+  available: boolean;
+  overall_status: string;
+  reason_code?: string;
+  message?: string;
+  url?: string;
+  result_count?: number;
+  latency_ms?: number;
+  search_available?: boolean;
+  direct_lookup_available?: boolean;
+  repair_action?: string;
+  models?: string[];
+  model_count?: number;
+  source?: string;
+  container_name?: string;
+  networks?: string[];
+  aliases?: string[];
+}
+
+export interface ManagedRuntimeGpuDevice {
+  path: string;
+  name?: string;
+  kind?: string;
+  vendor_id?: string;
+  vendor?: string;
+}
+
+export interface ManagedRuntimeGpuProbe {
+  available: boolean;
+  recommended_mode: string;
+  available_modes: string[];
+  nvidia_devices?: string[];
+  dri_devices?: ManagedRuntimeGpuDevice[];
+  render_devices?: ManagedRuntimeGpuDevice[];
+  card_devices?: ManagedRuntimeGpuDevice[];
+  kfd_present?: boolean;
+  message?: string;
+}
+
+export interface ManagedRuntimeGpuState {
+  requested_mode?: string;
+  selected_mode?: string;
+  mode_label?: string;
+  active?: boolean;
+  device_paths?: string[];
+  env?: Record<string, string>;
+  probe?: ManagedRuntimeGpuProbe;
+  fallback_reason?: string;
+  message?: string;
+}
+
+export interface ManagedRuntimeServiceRow {
+  name: string;
+  status: string;
+  message?: string;
+  image?: string;
+}
+
+export interface ManagedRuntimeCandidate {
+  id: string;
+  bundle_type: ManagedRuntimeBundleType;
+  adoptable: boolean;
+  project_name?: string;
+  published_url?: string;
+  url?: string;
+  service_count?: number;
+  expected_service_count?: number;
+  services_present?: string[];
+  health: ManagedRuntimeHealth;
+  models?: string[];
+  model_count?: number;
+}
+
+export interface ManagedRuntimeActionEntry {
+  action_id: string;
+  bundle_type: ManagedRuntimeBundleType;
+  action: string;
+  status: string;
+  payload?: Record<string, unknown>;
+  result?: Record<string, unknown>;
+  error?: string;
+  created_at: number;
+  updated_at: number;
+  completed_at?: number | null;
+}
+
+export interface ManagedRuntimeUpdateState {
+  enabled?: boolean;
+  interval_sec?: number;
+  strategy?: string;
+  next_planned_at?: number;
+  last_success_at?: number;
+  last_failure_at?: number;
+  last_error?: string;
+  last_deferred_at?: number;
+  last_deferred_reason?: string;
+}
+
+export interface ManagedRuntimeBundleStatus {
+  bundle_type: ManagedRuntimeBundleType;
+  mode: 'managed' | 'adopted' | 'external' | 'absent' | string;
+  state: string;
+  phase: string;
+  phase_message: string;
+  config_root?: string;
+  data_root?: string;
+  install_root?: string;
+  effective_url?: string;
+  ownership?: string;
+  health: ManagedRuntimeHealth;
+  services: ManagedRuntimeServiceRow[];
+  meta?: Record<string, unknown> & {
+    gpu?: ManagedRuntimeGpuState;
+    models?: string[];
+    model_count?: number;
+  };
+  last_error?: string;
+  update_state?: ManagedRuntimeUpdateState;
+  latest_action?: ManagedRuntimeActionEntry | null;
+  active?: boolean;
+  candidates?: ManagedRuntimeCandidate[];
+}
+
+export interface ManagedRuntimePreflight {
+  available: boolean;
+  docker_socket: string;
+  docker_socket_present: boolean;
+  docker_cli: string;
+  git_cli: string;
+  docker_ok: boolean;
+  compose_ok: boolean;
+  git_ok: boolean;
+  message: string;
+  self_container: string;
+  gpu_probe?: ManagedRuntimeGpuProbe;
+}
+
+export interface ManagedRuntimeStatusResponse {
+  preflight: ManagedRuntimePreflight;
+  config_root: string;
+  data_root: string;
+  ready: boolean;
+  bundles: Record<ManagedRuntimeBundleType, ManagedRuntimeBundleStatus>;
+}
+
+export interface ScalingRuntimeResponse {
+  musicbrainz: {
+    enabled: boolean;
+    queue_enabled: boolean;
+    mirror_enabled: boolean;
+    configured_mirror_enabled?: boolean;
+    fallback_to_public?: boolean;
+    fallback_reason?: string;
+    mirror_name?: string;
+    base_url?: string;
+    hostname?: string;
+    configured_base_url?: string;
+    mirror_health?: ManagedRuntimeHealth;
+    queue_pending: number;
+    queue_waiters: number;
+    public_rate_limit_per_sec: number;
+    current_rate_limit_per_sec?: number;
+    avg_latency_ms?: number;
+    last_latency_ms?: number;
+    completed_count?: number;
+    error_count?: number;
+    timeout_count?: number;
+  };
+  provider_gateway: {
+    enabled: boolean;
+    cache_enabled: boolean;
+    max_inflight: number;
+    inflight: number;
+    max_inflight_observed: number;
+    providers: Record<string, ProviderGatewayStatsBucket>;
+  };
+  metadata_workers: {
+    queue_enabled: boolean;
+    mode: 'local' | 'hybrid' | string;
+    worker_count: number;
+    batch_size: number;
+    worker_count_mode?: 'auto' | 'manual' | string;
+    batch_size_mode?: 'auto' | 'manual' | string;
+    effective_worker_count?: number;
+    effective_batch_size?: number;
+    queued?: number;
+    running?: number;
+    completed?: number;
+    failed?: number;
+    total?: number;
+    oldest_queued_at?: number | null;
+  };
+  pipeline: {
+    local_orchestrator: boolean;
+    materialization_local: boolean;
+    ocr_execution: string;
+    ai_mode: string;
+    scan_threads: number;
+    ffprobe_pool_size: number;
+    match_cover_ocr_mode: string;
+    ai_usage_level: string;
+    scan_ai_policy: string;
+  };
+  auto_tune?: {
+    enabled: boolean;
+    interval_sec: number;
+    mb_mirror_min_rps: number;
+    mb_mirror_max_rps: number;
+    provider_inflight_min: number;
+    provider_inflight_cap: number;
+    last_run_at?: number;
+    last_change_at?: number;
+    last_reason?: string;
+  };
+  managed_runtime?: ManagedRuntimeStatusResponse;
+  stage_rates: {
+    runtime_sec: number;
+    phase: string;
+    filesystem_entries_per_hour: number;
+    audio_files_per_hour: number;
+    albums_processed_per_hour: number;
+    albums_published_per_hour: number;
+    artists_processed_per_hour: number;
+  };
 }
 
 export interface ScanHistoryEntryOld {
@@ -1388,7 +2012,7 @@ const isApiError = (error: unknown): error is ApiError => {
   return error instanceof Error && typeof (error as ApiError).response !== 'undefined';
 };
 
-const GET_REQUEST_TIMEOUT_MS = 12000;
+const GET_REQUEST_TIMEOUT_MS = 30000;
 const inFlightGetRequests = new Map<string, Promise<unknown>>();
 
 type FetchApiRequestInit = RequestInit & {
@@ -1504,11 +2128,30 @@ export interface LibraryStats {
   artists: number;
   albums: number;
   tracks?: number;
+  scope?: LibraryBrowseScope;
+  fallback_source?: string | null;
+  index_running?: boolean;
+  index_phase?: string;
 }
 
-export async function getLibraryStats(options?: { includeUnmatched?: boolean }): Promise<LibraryStats> {
-  const q = new URLSearchParams();
+export type LibraryBrowseScope = 'library' | 'inbox' | 'dupes' | 'all';
+export type LibraryBrowseSource = 'auto' | 'live' | 'published';
+
+interface LibraryBrowseOptions {
+  includeUnmatched?: boolean;
+  scope?: LibraryBrowseScope;
+  browseSource?: LibraryBrowseSource;
+}
+
+function appendLibraryBrowseOptions(q: URLSearchParams, options?: LibraryBrowseOptions) {
   if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  if (options?.scope) q.set('scope', options.scope);
+  if (options?.browseSource) q.set('browse_source', options.browseSource);
+}
+
+export async function getLibraryStats(options?: LibraryBrowseOptions): Promise<LibraryStats> {
+  const q = new URLSearchParams();
+  appendLibraryBrowseOptions(q, options);
   const qs = q.toString();
   return fetchApi<LibraryStats>(`/api/library/stats${qs ? `?${qs}` : ''}`);
 }
@@ -1619,13 +2262,13 @@ export async function getLibraryDiscoverWithOptions(
   days = 90,
   limit = 18,
   refresh = false,
-  options?: { includeUnmatched?: boolean }
+  options?: LibraryBrowseOptions
 ): Promise<LibraryDiscoverResponse> {
   const qs = new URLSearchParams();
   qs.set('days', String(Math.max(7, Math.min(365, days))));
   qs.set('limit', String(Math.max(6, Math.min(36, limit))));
   if (refresh) qs.set('refresh', '1');
-  if (options?.includeUnmatched != null) qs.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  appendLibraryBrowseOptions(qs, options);
   return fetchApi<LibraryDiscoverResponse>(`/api/library/discover?${qs.toString()}`);
 }
 
@@ -1663,13 +2306,13 @@ export async function getLibrarySearchSuggest(query: string, limit = 12): Promis
 export async function getLibrarySearchSuggestWithOptions(
   query: string,
   limit = 12,
-  options?: { includeUnmatched?: boolean }
+  options?: LibraryBrowseOptions
 ): Promise<LibrarySearchSuggestResponse> {
   if (!query.trim()) return { query: '', items: [] };
   const qs = new URLSearchParams();
   qs.set('q', query.trim());
   qs.set('limit', String(Math.max(1, Math.min(40, limit))));
-  if (options?.includeUnmatched != null) qs.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  appendLibraryBrowseOptions(qs, options);
   return fetchApi<LibrarySearchSuggestResponse>(
     `/api/library/search/suggest?${qs.toString()}`
   );
@@ -1685,7 +2328,15 @@ export interface LibraryAlbumItem {
   track_count: number;
   format?: string | null;
   is_lossless: boolean;
+  sample_rate?: number | null;
+  bit_depth?: number | null;
   mb_identified?: boolean;
+  musicbrainz_release_group_id?: string | null;
+  discogs_release_id?: string | null;
+  lastfm_album_mbid?: string | null;
+  bandcamp_album_url?: string | null;
+  metadata_source?: string | null;
+  strict_match_provider?: string | null;
   thumb?: string | null;
   artist_id: number;
   artist_name: string;
@@ -1697,6 +2348,10 @@ export interface LibraryAlbumItem {
   public_rating_source?: string | null;
   heat_score?: number | null;
   classical?: ClassicalIdentityPayload | null;
+  publication_state?: 'published' | 'enriching' | 'ready' | string | null;
+  cover_state?: 'ready' | 'enriching' | 'missing' | 'fallback' | string | null;
+  artist_media_state?: 'ready' | 'enriching' | 'missing' | string | null;
+  profile_state?: 'ready' | 'enriching' | 'missing' | string | null;
 }
 
 export interface LibraryAlbumsResponse {
@@ -1704,6 +2359,9 @@ export interface LibraryAlbumsResponse {
   total: number;
   limit: number;
   offset: number;
+  has_more?: boolean;
+  publication_state?: 'published' | 'enriching' | 'ready' | string | null;
+  background_enrichment_running?: boolean;
   error?: string;
 }
 
@@ -1737,12 +2395,12 @@ export async function getLibraryDigest(limit = 12, trigger = true): Promise<Libr
 export async function getLibraryDigestWithOptions(
   limit = 12,
   trigger = true,
-  options?: { includeUnmatched?: boolean }
+  options?: LibraryBrowseOptions
 ): Promise<LibraryDigestResponse> {
   const q = new URLSearchParams();
   q.set('limit', String(Math.max(1, Math.min(36, limit))));
   if (!trigger) q.set('trigger', '0');
-  if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  appendLibraryBrowseOptions(q, options);
   return fetchApi<LibraryDigestResponse>(`/api/library/digest?${q.toString()}`);
 }
 
@@ -1755,6 +2413,9 @@ export async function getLibraryAlbums(options?: {
   limit?: number;
   offset?: number;
   includeUnmatched?: boolean;
+  scope?: LibraryBrowseScope;
+  browseSource?: LibraryBrowseSource;
+  refresh?: boolean;
 }): Promise<LibraryAlbumsResponse> {
   const q = new URLSearchParams();
   if (options?.search) q.set('search', options.search);
@@ -1764,7 +2425,8 @@ export async function getLibraryAlbums(options?: {
   if (options?.year != null) q.set('year', String(options.year));
   if (options?.limit != null) q.set('limit', String(Math.max(1, Math.min(240, options.limit))));
   if (options?.offset != null) q.set('offset', String(Math.max(0, options.offset)));
-  if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  if (options?.refresh) q.set('refresh', '1');
+  appendLibraryBrowseOptions(q, options);
   const qs = q.toString();
   return fetchApi<LibraryAlbumsResponse>(`/api/library/albums${qs ? `?${qs}` : ''}`);
 }
@@ -1787,9 +2449,9 @@ export interface LibraryFacetsResponse {
   error?: string;
 }
 
-export async function getLibraryFacets(options?: { includeUnmatched?: boolean }): Promise<LibraryFacetsResponse> {
+export async function getLibraryFacets(options?: LibraryBrowseOptions): Promise<LibraryFacetsResponse> {
   const q = new URLSearchParams();
-  if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  appendLibraryBrowseOptions(q, options);
   const qs = q.toString();
   return fetchApi<LibraryFacetsResponse>(`/api/library/facets${qs ? `?${qs}` : ''}`);
 }
@@ -1804,7 +2466,7 @@ export async function suggestLibraryGenres(
   query = '',
   limit = 16,
   refresh = false,
-  filters?: { label?: string; year?: number | null; includeUnmatched?: boolean }
+  filters?: { label?: string; year?: number | null; includeUnmatched?: boolean; scope?: LibraryBrowseScope }
 ): Promise<LibraryGenresSuggestResponse> {
   const q = new URLSearchParams();
   if (query.trim()) q.set('q', query.trim());
@@ -1812,7 +2474,7 @@ export async function suggestLibraryGenres(
   if (refresh) q.set('refresh', '1');
   if (filters?.label) q.set('label', String(filters.label));
   if (filters?.year != null) q.set('year', String(filters.year));
-  if (filters?.includeUnmatched != null) q.set('include_unmatched', filters.includeUnmatched ? '1' : '0');
+  appendLibraryBrowseOptions(q, filters);
   return fetchApi<LibraryGenresSuggestResponse>(`/api/library/genres/suggest?${q.toString()}`);
 }
 
@@ -1826,7 +2488,7 @@ export async function suggestLibraryLabels(
   query = '',
   limit = 16,
   refresh = false,
-  filters?: { genre?: string; year?: number | null; includeUnmatched?: boolean }
+  filters?: { genre?: string; year?: number | null; includeUnmatched?: boolean; scope?: LibraryBrowseScope }
 ): Promise<LibraryLabelsSuggestResponse> {
   const q = new URLSearchParams();
   if (query.trim()) q.set('q', query.trim());
@@ -1834,7 +2496,7 @@ export async function suggestLibraryLabels(
   if (refresh) q.set('refresh', '1');
   if (filters?.genre) q.set('genre', String(filters.genre));
   if (filters?.year != null) q.set('year', String(filters.year));
-  if (filters?.includeUnmatched != null) q.set('include_unmatched', filters.includeUnmatched ? '1' : '0');
+  appendLibraryBrowseOptions(q, filters);
   return fetchApi<LibraryLabelsSuggestResponse>(`/api/library/labels/suggest?${q.toString()}`);
 }
 
@@ -1854,13 +2516,13 @@ export async function getLibraryGenreLabels(
   genre: string,
   limit = 80,
   refresh = false,
-  options?: { includeUnmatched?: boolean }
+  options?: LibraryBrowseOptions
 ): Promise<LibraryGenreLabelsResponse> {
   const g = genre.trim();
   const q = new URLSearchParams();
   q.set('limit', String(Math.max(1, Math.min(200, limit))));
   if (refresh) q.set('refresh', '1');
-  if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  appendLibraryBrowseOptions(q, options);
   return fetchApi<LibraryGenreLabelsResponse>(`/api/library/genre/${encodeURIComponent(g)}/labels?${q.toString()}`);
 }
 
@@ -1887,14 +2549,14 @@ export async function getLibraryRecentlyPlayedAlbumsWithOptions(
   days = 90,
   limit = 18,
   refresh = false,
-  options?: { includeUnmatched?: boolean; offset?: number }
+  options?: { includeUnmatched?: boolean; offset?: number; scope?: LibraryBrowseScope }
 ): Promise<LibraryRecentlyPlayedAlbumsResponse> {
   const q = new URLSearchParams();
   q.set('days', String(Math.max(7, Math.min(365, days))));
   q.set('limit', String(Math.max(1, Math.min(200, limit))));
   if (options?.offset != null) q.set('offset', String(Math.max(0, options.offset)));
   if (refresh) q.set('refresh', '1');
-  if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  appendLibraryBrowseOptions(q, options);
   return fetchApi<LibraryRecentlyPlayedAlbumsResponse>(`/api/library/recently-played/albums?${q.toString()}`);
 }
 
@@ -1903,7 +2565,14 @@ export interface LibraryArtistItem {
   artist_name: string;
   album_count: number;
   broken_albums_count?: number;
+  artist_fallback_thumb?: string | null;
   artist_thumb?: string | null;
+  artist_has_image?: boolean;
+  artist_profile_source?: string | null;
+  publication_state?: 'published' | 'enriching' | 'ready' | string | null;
+  cover_state?: 'ready' | 'enriching' | 'missing' | 'fallback' | string | null;
+  artist_media_state?: 'ready' | 'enriching' | 'missing' | string | null;
+  profile_state?: 'ready' | 'enriching' | 'missing' | string | null;
 }
 
 export interface LibraryArtistsResponse {
@@ -1911,26 +2580,35 @@ export interface LibraryArtistsResponse {
   total: number;
   limit: number;
   offset: number;
+  has_more?: boolean;
+  publication_state?: 'published' | 'enriching' | 'ready' | string | null;
+  background_enrichment_running?: boolean;
   error?: string;
 }
 
 export async function getLibraryArtists(options?: {
   search?: string;
+  sort?: 'recent' | 'alpha' | 'albums' | 'relevance';
   genre?: string;
   label?: string;
   year?: number;
   limit?: number;
   offset?: number;
   includeUnmatched?: boolean;
+  scope?: LibraryBrowseScope;
+  browseSource?: LibraryBrowseSource;
+  refresh?: boolean;
 }): Promise<LibraryArtistsResponse> {
   const q = new URLSearchParams();
   if (options?.search) q.set('search', options.search);
+  if (options?.sort) q.set('sort', options.sort);
   if (options?.genre) q.set('genre', options.genre);
   if (options?.label) q.set('label', options.label);
   if (options?.year != null) q.set('year', String(options.year));
   if (options?.limit != null) q.set('limit', String(Math.max(1, Math.min(500, options.limit))));
   if (options?.offset != null) q.set('offset', String(Math.max(0, options.offset)));
-  if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  appendLibraryBrowseOptions(q, options);
+  if (options?.refresh) q.set('refresh', '1');
   const qs = q.toString();
   return fetchApi<LibraryArtistsResponse>(`/api/library/artists${qs ? `?${qs}` : ''}`);
 }
@@ -1950,6 +2628,7 @@ export async function getLibraryGenres(options?: {
   limit?: number;
   offset?: number;
   includeUnmatched?: boolean;
+  scope?: LibraryBrowseScope;
 }): Promise<LibraryGenresResponse> {
   const q = new URLSearchParams();
   if (options?.search) q.set('search', options.search);
@@ -1957,7 +2636,7 @@ export async function getLibraryGenres(options?: {
   if (options?.year != null) q.set('year', String(options.year));
   if (options?.limit != null) q.set('limit', String(Math.max(1, Math.min(200, options.limit))));
   if (options?.offset != null) q.set('offset', String(Math.max(0, options.offset)));
-  if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  appendLibraryBrowseOptions(q, options);
   const qs = q.toString();
   return fetchApi<LibraryGenresResponse>(`/api/library/genres${qs ? `?${qs}` : ''}`);
 }
@@ -1977,6 +2656,8 @@ export async function getLibraryLabels(options?: {
   limit?: number;
   offset?: number;
   includeUnmatched?: boolean;
+  scope?: LibraryBrowseScope;
+  refresh?: boolean;
 }): Promise<LibraryLabelsResponse> {
   const q = new URLSearchParams();
   if (options?.search) q.set('search', options.search);
@@ -1984,7 +2665,8 @@ export async function getLibraryLabels(options?: {
   if (options?.year != null) q.set('year', String(options.year));
   if (options?.limit != null) q.set('limit', String(Math.max(1, Math.min(200, options.limit))));
   if (options?.offset != null) q.set('offset', String(Math.max(0, options.offset)));
-  if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  appendLibraryBrowseOptions(q, options);
+  if (options?.refresh) q.set('refresh', '1');
   const qs = q.toString();
   return fetchApi<LibraryLabelsResponse>(`/api/library/labels${qs ? `?${qs}` : ''}`);
 }
@@ -2010,13 +2692,13 @@ export interface TopArtistsResponse {
 export async function getTopArtists(
   limit = 18,
   days = 0,
-  options?: { includeUnmatched?: boolean; offset?: number }
+  options?: { includeUnmatched?: boolean; offset?: number; scope?: LibraryBrowseScope }
 ): Promise<TopArtistsResponse> {
   const q = new URLSearchParams();
   q.set('limit', String(Math.max(1, Math.min(200, limit))));
   if (options?.offset != null) q.set('offset', String(Math.max(0, options.offset)));
   if (days && days > 0) q.set('days', String(Math.max(1, Math.min(3650, days))));
-  if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  appendLibraryBrowseOptions(q, options);
   return fetchApi<TopArtistsResponse>(`/api/library/artists/top?${q.toString()}`);
 }
 
@@ -2035,11 +2717,11 @@ export interface RecentlyAddedArtistsResponse {
   error?: string;
 }
 
-export async function getRecentlyAddedArtists(limit = 18, offset = 0, options?: { includeUnmatched?: boolean }): Promise<RecentlyAddedArtistsResponse> {
+export async function getRecentlyAddedArtists(limit = 18, offset = 0, options?: { includeUnmatched?: boolean; scope?: LibraryBrowseScope }): Promise<RecentlyAddedArtistsResponse> {
   const q = new URLSearchParams();
   q.set('limit', String(Math.max(1, Math.min(60, limit))));
   q.set('offset', String(Math.max(0, offset)));
-  if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  appendLibraryBrowseOptions(q, options);
   return fetchApi<RecentlyAddedArtistsResponse>(`/api/library/artists/recent?${q.toString()}`);
 }
 
@@ -2085,6 +2767,10 @@ export interface SocialUser {
   share_liked_public?: boolean;
   share_recommendations_public?: boolean;
   avatar_data_url?: string | null;
+  concerts_filter_enabled?: boolean;
+  concerts_home_lat?: string;
+  concerts_home_lon?: string;
+  concerts_radius_km?: string;
   created_at: number;
   updated_at: number;
   last_login_at?: number | null;
@@ -2288,12 +2974,12 @@ export interface GenreProfileResponse {
 
 export async function getGenreProfile(
   genre: string,
-  options?: { limit_artists?: number; refresh?: boolean; includeUnmatched?: boolean }
+  options?: { limit_artists?: number; refresh?: boolean; includeUnmatched?: boolean; scope?: LibraryBrowseScope }
 ): Promise<GenreProfileResponse> {
   const q = new URLSearchParams();
   if (options?.limit_artists != null) q.set('limit_artists', String(Math.max(1, Math.min(120, options.limit_artists))));
   if (options?.refresh) q.set('refresh', '1');
-  if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  appendLibraryBrowseOptions(q, options);
   return fetchApi<GenreProfileResponse>(`/api/library/genre/${encodeURIComponent(genre)}/profile?${q.toString()}`);
 }
 
@@ -2321,18 +3007,20 @@ export interface LabelProfileResponse {
   genres: LabelProfileGenreItem[];
   discogs_profile?: string;
   discogs_url?: string;
+  logo_url?: string;
+  logo_provider?: string;
   error?: string;
 }
 
 export async function getLabelProfile(
   label: string,
-  options?: { limit_artists?: number; limit_genres?: number; refresh?: boolean; includeUnmatched?: boolean }
+  options?: { limit_artists?: number; limit_genres?: number; refresh?: boolean; includeUnmatched?: boolean; scope?: LibraryBrowseScope }
 ): Promise<LabelProfileResponse> {
   const q = new URLSearchParams();
   if (options?.limit_artists != null) q.set('limit_artists', String(Math.max(1, Math.min(120, options.limit_artists))));
   if (options?.limit_genres != null) q.set('limit_genres', String(Math.max(1, Math.min(120, options.limit_genres))));
   if (options?.refresh) q.set('refresh', '1');
-  if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  appendLibraryBrowseOptions(q, options);
   return fetchApi<LabelProfileResponse>(`/api/library/label/${encodeURIComponent(label)}/profile?${q.toString()}`);
 }
 
@@ -2517,6 +3205,13 @@ export interface AlbumDetailReview {
   updated_at?: number;
 }
 
+export interface AlbumBandcampSupporterComment {
+  author?: string | null;
+  text?: string | null;
+  url?: string | null;
+  avatar_url?: string | null;
+}
+
 export interface ClassicalIdentityPayload {
   is_classical?: boolean;
   composer?: string[];
@@ -2560,6 +3255,8 @@ export interface AlbumDetailResponse {
   label?: string;
   format?: string;
   is_lossless?: boolean;
+  sample_rate?: number | null;
+  bit_depth?: number | null;
   track_count: number;
   total_duration_sec: number;
   has_cover?: boolean;
@@ -2573,6 +3270,8 @@ export interface AlbumDetailResponse {
   review?: AlbumDetailReview;
   ratings?: {
     user_rating?: number | null;
+    user_review_text?: string | null;
+    user_review_updated_at?: number | null;
     public_rating?: number | null;
     public_rating_votes?: number | null;
     public_rating_source?: string | null;
@@ -2581,6 +3280,7 @@ export interface AlbumDetailResponse {
       discogs_have_count?: number | null;
       discogs_want_count?: number | null;
       bandcamp_supporter_count?: number | null;
+      bandcamp_supporter_comments?: AlbumBandcampSupporterComment[] | null;
       lastfm_scrobbles?: number | null;
       lastfm_listeners?: number | null;
     };
@@ -2588,8 +3288,11 @@ export interface AlbumDetailResponse {
   tracks: AlbumDetailTrack[];
 }
 
-export async function getAlbumDetail(albumId: number): Promise<AlbumDetailResponse> {
-  return fetchApi<AlbumDetailResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}`, {
+export async function getAlbumDetail(albumId: number, options?: { refresh?: boolean }): Promise<AlbumDetailResponse> {
+  const q = new URLSearchParams();
+  if (options?.refresh) q.set('refresh', '1');
+  const qs = q.toString();
+  return fetchApi<AlbumDetailResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}${qs ? `?${qs}` : ''}`, {
     timeoutMs: 30000,
   });
 }
@@ -2604,6 +3307,7 @@ export interface AlbumUserRatingResponse {
   album_id: number;
   user_id: number;
   rating?: number | null;
+  review_text?: string | null;
   updated_at?: number | null;
 }
 
@@ -2616,6 +3320,17 @@ export async function setAlbumRating(albumId: number, rating: number | null, sou
   return fetchApi<AlbumUserRatingResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}/rating`, {
     method: 'PUT',
     body: JSON.stringify({ rating: normalized, source }),
+  });
+}
+
+export async function getAlbumReview(albumId: number): Promise<AlbumUserRatingResponse> {
+  return fetchApi<AlbumUserRatingResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}/review`);
+}
+
+export async function setAlbumReview(albumId: number, reviewText: string, source = 'ui'): Promise<AlbumUserRatingResponse> {
+  return fetchApi<AlbumUserRatingResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}/review`, {
+    method: 'PUT',
+    body: JSON.stringify({ review_text: reviewText, source }),
   });
 }
 
@@ -3111,10 +3826,67 @@ export async function normalizeAlbumNames(albumIds?: number[]): Promise<{ rename
   );
 }
 
-// Duplicates (scan-only by default; use source=all for scan + library-only groups on large libraries)
+// Duplicates default to the global open-review registry. Use source=scan only for explicit run debugging.
 export async function getDuplicates(options?: { source?: 'scan' | 'all' }): Promise<DuplicateCard[]> {
-  const source = options?.source ?? 'scan';
+  const source = options?.source ?? 'all';
   return fetchApi<DuplicateCard[]>(`/api/duplicates?source=${source}`);
+}
+
+export interface ReviewStats {
+  available?: boolean;
+  scan_id?: number | null;
+  duplicates?: {
+    groups?: number;
+    losers?: number;
+    manual_review_groups?: number;
+    no_move_groups?: number;
+    same_folder_groups?: number;
+    loser_size_mb?: number;
+    loser_size_gb?: number;
+  };
+  incompletes?: {
+    albums?: number;
+    artists?: number;
+    quarantine_eligible?: number;
+    track_count_deficits?: number;
+    classification_counts?: Record<string, number>;
+    status_counts?: Record<string, number>;
+  };
+}
+
+export interface PMDAJobStatusEntry {
+  job_id: string;
+  job_type: string;
+  status: string;
+  running: boolean;
+  phase?: string | null;
+  label?: string | null;
+  done?: number;
+  total?: number;
+  unit?: string;
+  percent?: number;
+  heartbeat_at?: number | null;
+  last_item?: string | null;
+  eta_seconds?: number | null;
+  blockers?: string[];
+  details?: Record<string, unknown>;
+}
+
+export interface PMDAJobsStatusResponse {
+  generated_at: number;
+  jobs: Record<string, PMDAJobStatusEntry>;
+  running: string[];
+  post_publication_jobs: string[];
+  notes?: {
+    publication_blocks_browse?: boolean;
+    post_publication_blocks_scan_completion?: boolean;
+    files_mode_opens_plex_db?: boolean;
+    [key: string]: unknown;
+  };
+}
+
+export async function getReviewStats(): Promise<ReviewStats> {
+  return fetchApi<ReviewStats>('/api/review/stats');
 }
 
 export async function getDuplicateDetails(artist: string, albumId: string): Promise<DuplicateDetails> {
@@ -3124,11 +3896,19 @@ export async function getDuplicateDetails(artist: string, albumId: string): Prom
 
 // Scan
 export async function getScanProgress(): Promise<ScanProgress> {
-  return fetchApi<ScanProgress>('/api/progress');
+  return fetchApi<ScanProgress>('/api/progress', { timeoutMs: 20000 });
+}
+
+export async function getJobsStatus(): Promise<PMDAJobsStatusResponse> {
+  return fetchApi<PMDAJobsStatusResponse>('/api/jobs/status', { timeoutMs: 10000 });
 }
 
 export async function getCacheControlMetrics(force: boolean = false): Promise<CacheControlMetrics> {
   return fetchApi<CacheControlMetrics>(`/api/statistics/cache-control${force ? '?force=true' : ''}`);
+}
+
+export async function getEnrichmentSources(): Promise<EnrichmentSourcesResponse> {
+  return fetchApi<EnrichmentSourcesResponse>('/api/statistics/enrichment-sources');
 }
 
 export async function getBenchmarkReports(limit: number = 40): Promise<BenchmarkReportsResponse> {
@@ -3136,9 +3916,173 @@ export async function getBenchmarkReports(limit: number = 40): Promise<Benchmark
   return fetchApi<BenchmarkReportsResponse>(`/api/statistics/benchmark-reports?limit=${safeLimit}`);
 }
 
-export async function getScanLogsTail(lines: number = 180): Promise<LogTailResponse> {
+export async function getAIOverview(): Promise<AIOverviewResponse> {
+  return fetchApi<AIOverviewResponse>('/api/ai/overview');
+}
+
+export async function getScalingRuntime(): Promise<ScalingRuntimeResponse> {
+  return fetchApi<ScalingRuntimeResponse>('/api/statistics/scaling-runtime');
+}
+
+export interface ManagedRuntimeBootstrapBundleRequest {
+  action?: 'auto' | 'create' | 'adopt';
+  candidate_id?: string;
+  mirror_name?: string;
+  fast_model?: string;
+  hard_model?: string;
+}
+
+export interface ManagedRuntimeBootstrapRequest {
+  config_root?: string;
+  data_root?: string;
+  bundle_type?: ManagedRuntimeBundleType;
+  payload?: ManagedRuntimeBootstrapBundleRequest;
+  bundles?: Partial<Record<ManagedRuntimeBundleType, ManagedRuntimeBootstrapBundleRequest>>;
+}
+
+export interface ManagedRuntimeBootstrapResponse {
+  results: Array<{
+    bundle_type: ManagedRuntimeBundleType;
+    started: boolean;
+    message: string;
+    status: ManagedRuntimeBundleStatus;
+  }>;
+  snapshot: ManagedRuntimeStatusResponse;
+}
+
+export interface ManagedRuntimeAdoptRequest {
+  bundle_type: ManagedRuntimeBundleType;
+  candidate_id?: string;
+  project_name?: string;
+  url?: string;
+  config_root?: string;
+  data_root?: string;
+  fast_model?: string;
+  hard_model?: string;
+}
+
+export interface ManagedRuntimeActionRequest {
+  bundle_type: ManagedRuntimeBundleType;
+  action:
+    | 'refresh-health'
+    | 'retry-bootstrap'
+    | 'rebuild'
+    | 'start'
+    | 'stop'
+    | 'restart'
+    | 'reset'
+    | 'retry-update'
+    | 'repair-search-index'
+    | 'pull-model';
+  config_root?: string;
+  data_root?: string;
+  mirror_name?: string;
+  fast_model?: string;
+  hard_model?: string;
+  model?: string;
+}
+
+export interface ManagedRuntimeLogsResponse {
+  logs: Array<{
+    log_id: number;
+    bundle_type: string;
+    service_name: string;
+    level: string;
+    message: string;
+    created_at: number;
+  }>;
+  bundle_type?: string | null;
+  service_name?: string | null;
+}
+
+export type McpScope = 'read' | 'scan_control' | 'runtime_repair' | 'review_propose' | string;
+
+export interface McpTokenSummary {
+  token_id: string;
+  name: string;
+  scopes: McpScope[];
+  active: boolean;
+  created_at?: number | null;
+  expires_at?: number | null;
+  last_used_at?: number | null;
+  revoked_at?: number | null;
+}
+
+export interface McpAuditEntry {
+  audit_id: number;
+  token_id?: string | null;
+  tool: string;
+  status: string;
+  message?: string;
+  args?: Record<string, unknown>;
+  duration_ms: number;
+  created_at: number;
+  ip?: string;
+  user_agent?: string;
+}
+
+export interface McpStatusSummary {
+  enabled: boolean;
+  active_token?: McpTokenSummary | null;
+  token_active?: boolean;
+  scopes?: McpScope[];
+  last_access_at?: number | null;
+  audit?: McpAuditEntry[];
+}
+
+export interface McpRotateTokenResponse {
+  status: string;
+  token: string;
+  token_display_once: boolean;
+  active_token?: McpTokenSummary | null;
+  mcp: McpStatusSummary;
+  message?: string;
+}
+
+export async function getManagedRuntimeStatus(options?: { skipCandidates?: boolean }): Promise<ManagedRuntimeStatusResponse> {
+  const query = options?.skipCandidates ? '?skip_candidates=true' : '?include_candidates=true';
+  return fetchApi<ManagedRuntimeStatusResponse>(`/api/runtime/managed/status${query}`, {
+    timeoutMs: options?.skipCandidates ? 20000 : 45000,
+  });
+}
+
+export async function bootstrapManagedRuntime(payload: ManagedRuntimeBootstrapRequest): Promise<ManagedRuntimeBootstrapResponse> {
+  return fetchApi<ManagedRuntimeBootstrapResponse>('/api/runtime/managed/bootstrap', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    timeoutMs: 60000,
+  });
+}
+
+export async function adoptManagedRuntime(payload: ManagedRuntimeAdoptRequest): Promise<{ status: string; bundle_type: ManagedRuntimeBundleType; result: ManagedRuntimeBundleStatus; snapshot: ManagedRuntimeStatusResponse }> {
+  return fetchApi<{ status: string; bundle_type: ManagedRuntimeBundleType; result: ManagedRuntimeBundleStatus; snapshot: ManagedRuntimeStatusResponse }>('/api/runtime/managed/adopt', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    timeoutMs: 30000,
+  });
+}
+
+export async function managedRuntimeAction(payload: ManagedRuntimeActionRequest): Promise<{ status: string; message?: string; bundle_type?: ManagedRuntimeBundleType; action?: string; result?: ManagedRuntimeBundleStatus; snapshot?: ManagedRuntimeStatusResponse; run_id?: string | null; active?: OllamaPullStatus }> {
+  return fetchApi<{ status: string; message?: string; bundle_type?: ManagedRuntimeBundleType; action?: string; result?: ManagedRuntimeBundleStatus; snapshot?: ManagedRuntimeStatusResponse; run_id?: string | null; active?: OllamaPullStatus }>('/api/runtime/managed/action', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    timeoutMs: 30000,
+  });
+}
+
+export async function getManagedRuntimeLogs(options?: { bundleType?: ManagedRuntimeBundleType; serviceName?: string; limit?: number }): Promise<ManagedRuntimeLogsResponse> {
+  const params = new URLSearchParams();
+  if (options?.bundleType) params.set('bundle_type', options.bundleType);
+  if (options?.serviceName) params.set('service_name', options.serviceName);
+  if (typeof options?.limit === 'number') params.set('limit', String(options.limit));
+  const query = params.toString() ? `?${params.toString()}` : '';
+  return fetchApi<ManagedRuntimeLogsResponse>(`/api/runtime/managed/logs${query}`);
+}
+
+export async function getScanLogsTail(lines: number = 180, options?: { scanMode?: boolean }): Promise<LogTailResponse> {
   const n = Number.isFinite(lines) ? Math.max(20, Math.min(1200, Math.trunc(lines))) : 180;
-  return fetchApi<LogTailResponse>(`/api/logs/tail?lines=${n}`);
+  const scanMode = options?.scanMode !== false;
+  return fetchApi<LogTailResponse>(`/api/logs/tail?lines=${n}&scan_mode=${scanMode ? '1' : '0'}`);
 }
 
 export interface ScanPreflightResult {
@@ -3147,8 +4091,8 @@ export interface ScanPreflightResult {
   discogs?: { ok: boolean; message: string };
   lastfm?: { ok: boolean; message: string };
   fanart?: { ok: boolean; message: string };
+  audiodb?: { ok: boolean; message: string };
   bandcamp?: { ok: boolean; message: string };
-  searxng?: { ok: boolean; message: string };
   serper?: { ok: boolean; message: string };
   acoustid?: { ok: boolean; message: string };
   paths?: { music_rw: boolean; dupes_rw: boolean };
@@ -3330,7 +4274,9 @@ export interface IncompleteAlbumItem {
   title_raw: string;
   folder: string;
   classification: string;
-  missing_in_plex: number[];
+  /** Compatibility name for older databases. Prefer missing_from_index in UI code. */
+  missing_in_plex?: number[];
+  missing_from_index?: number[];
   missing_on_disk: string[];
   expected_track_count: number;
   actual_track_count: number;
@@ -3478,26 +4424,6 @@ export async function improveDroppedAlbum(files: File[], folderName?: string): P
   };
 }
 
-export interface LidarrAddIncompleteProgress {
-  running: boolean;
-  current: number;
-  total: number;
-  current_album?: string;
-  current_artist?: string;
-  added: number;
-  failed: number;
-  result?: { added?: number; failed?: number; total?: number; error?: string };
-  finished?: boolean;
-}
-
-export async function addIncompleteAlbumsToLidarr(): Promise<{ started: boolean; total: number }> {
-  return fetchApi<{ started: boolean; total: number }>('/api/lidarr/add-incomplete-albums', { method: 'POST' });
-}
-
-export async function getLidarrAddIncompleteProgress(): Promise<LidarrAddIncompleteProgress> {
-  return fetchApi<LidarrAddIncompleteProgress>('/api/lidarr/add-incomplete-albums/progress');
-}
-
 export async function dedupeArtist(
   artist: string,
   albumId?: string,
@@ -3574,6 +4500,10 @@ export interface AuthUser {
   share_liked_public?: boolean;
   share_recommendations_public?: boolean;
   avatar_data_url?: string | null;
+  concerts_filter_enabled?: boolean;
+  concerts_home_lat?: string;
+  concerts_home_lon?: string;
+  concerts_radius_km?: string;
   created_at: number;
   updated_at: number;
   last_login_at?: number | null;
@@ -3613,11 +4543,26 @@ export interface AuthProfileUpdateRequest {
   share_liked_public?: boolean;
   share_recommendations_public?: boolean;
   avatar_data_url?: string | null;
+  concerts_filter_enabled?: boolean;
+  concerts_home_lat?: string;
+  concerts_home_lon?: string;
+  concerts_radius_km?: string;
 }
 
 export interface AuthProfileUpdateResponse {
   ok: boolean;
   user: AuthUser;
+}
+
+export interface AuthPasswordChangeRequest {
+  current_password: string;
+  new_password: string;
+  new_password_confirm: string;
+}
+
+export interface AuthPasswordChangeResponse {
+  ok: boolean;
+  reauth_required?: boolean;
 }
 
 export interface AdminUsersResponse {
@@ -3685,6 +4630,13 @@ export async function updateAuthProfile(payload: AuthProfileUpdateRequest): Prom
   });
 }
 
+export async function changeAuthPassword(payload: AuthPasswordChangeRequest): Promise<AuthPasswordChangeResponse> {
+  return fetchApi<AuthPasswordChangeResponse>('/api/auth/password', {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function logout(): Promise<{ ok: boolean }> {
   return fetchApi<{ ok: boolean }>('/api/auth/logout', { method: 'POST' });
 }
@@ -3726,6 +4678,28 @@ export async function saveConfig(config: Partial<PMDAConfig>): Promise<{ status:
     method: 'PUT',
     body: JSON.stringify(config),
   });
+}
+
+export async function getMcpStatus(): Promise<McpStatusSummary> {
+  return fetchApi<McpStatusSummary>('/api/admin/mcp/status');
+}
+
+export async function rotateMcpToken(scopes?: McpScope[]): Promise<McpRotateTokenResponse> {
+  return fetchApi<McpRotateTokenResponse>('/api/admin/mcp/token/rotate', {
+    method: 'POST',
+    body: JSON.stringify({ scopes }),
+  });
+}
+
+export async function revokeMcpToken(): Promise<{ status: string; revoked: number; mcp: McpStatusSummary }> {
+  return fetchApi<{ status: string; revoked: number; mcp: McpStatusSummary }>('/api/admin/mcp/token/revoke', {
+    method: 'POST',
+  });
+}
+
+export async function getMcpAudit(limit = 50): Promise<{ items: McpAuditEntry[]; limit: number }> {
+  const safeLimit = Math.max(1, Math.min(200, Number(limit) || 50));
+  return fetchApi<{ items: McpAuditEntry[]; limit: number }>(`/api/admin/mcp/audit?limit=${safeLimit}`);
 }
 
 export async function getTaskEvents(afterId = 0, limit = 100): Promise<TaskEventsResponse> {
@@ -3774,6 +4748,43 @@ export async function postLibraryFilesIndexRebuild(): Promise<{ status: string; 
   return fetchApi<{ status: string; message?: string; progress?: unknown }>('/api/library/files-index/rebuild', { method: 'POST' });
 }
 
+export interface LibraryFilesIndexStatus {
+  running: boolean;
+  started_at?: number | null;
+  finished_at?: number | null;
+  updated_at?: number | null;
+  phase?: string | null;
+  phase_started_at?: number | null;
+  phase_message?: string | null;
+  phase_progress?: number | null;
+  phase_eta_seconds?: number | null;
+  phase_rate_per_sec?: number | null;
+  current_folder?: string | null;
+  current_artist?: string | null;
+  phase_item_done?: number | null;
+  phase_item_total?: number | null;
+  phase_item_label?: string | null;
+  folders_processed?: number;
+  total_folders?: number;
+  collapsed_groups?: number;
+  discovered_folder_groups?: number;
+  collapse_parent_folders_processed?: number;
+  collapse_parent_folders_total?: number;
+  entries_scanned?: number;
+  discovered_audio_files?: number;
+  artists?: number;
+  albums?: number;
+  tracks?: number;
+  indexed_artists?: number;
+  indexed_albums?: number;
+  indexed_tracks?: number;
+  error?: string | null;
+}
+
+export async function getLibraryFilesIndexStatus(): Promise<LibraryFilesIndexStatus> {
+  return fetchApi<LibraryFilesIndexStatus>('/api/library/files-index/status');
+}
+
 /** Files backend: export progress (running, tracks_done, total_tracks, albums_done, total_albums, error). */
 export interface FilesExportStatus {
   running: boolean;
@@ -3785,6 +4796,33 @@ export interface FilesExportStatus {
 }
 export async function getFilesExportStatus(): Promise<FilesExportStatus> {
   return fetchApi<FilesExportStatus>('/api/files/export/status');
+}
+
+export interface FilesProfileBackfillStatus {
+  running: boolean;
+  reason?: string;
+  started_at?: number | null;
+  finished_at?: number | null;
+  cover_only?: boolean;
+  current?: number;
+  total?: number;
+  current_artist?: string;
+  errors?: number;
+  pending_artist_profiles?: number;
+  pending_album_profiles?: number;
+  eligible_album_profiles?: number;
+  pending_album_covers?: number;
+}
+
+export async function getFilesProfileBackfillStatus(): Promise<FilesProfileBackfillStatus> {
+  return fetchApi<FilesProfileBackfillStatus>('/api/library/files-profile-backfill/status');
+}
+
+export async function startFilesProfileBackfill(payload?: { reason?: string; cover_only?: boolean }): Promise<{ status: string; progress?: FilesProfileBackfillStatus }> {
+  return fetchApi<{ status: string; progress?: FilesProfileBackfillStatus }>('/api/library/files-profile-backfill/start', {
+    method: 'POST',
+    body: JSON.stringify(payload || {}),
+  });
 }
 
 /** Files backend: structure overview (templates, metrics, samples). */
@@ -3827,7 +4865,9 @@ export async function getFilesystemDirectories(
   });
 }
 
-export async function testMusicBrainz(useMusicBrainz?: boolean): Promise<{ success: boolean; message: string }> {
+export async function testMusicBrainz(
+  useMusicBrainz?: boolean,
+): Promise<{ success: boolean; message: string; base_url?: string; mirror_enabled?: boolean; mirror_name?: string }> {
   try {
     const body = useMusicBrainz !== undefined ? { USE_MUSICBRAINZ: useMusicBrainz } : undefined;
     const response = await fetchWithAuth('/api/musicbrainz/test', {
@@ -4278,6 +5318,153 @@ export async function dedupeScan(scanId: number): Promise<{ status: string; mess
   });
 }
 
+export interface TrashReleaseSignal {
+  kind: string;
+  label: string;
+  score: number;
+  matched?: string | null;
+}
+
+export interface TrashReleaseCandidate {
+  album_id: number;
+  artist: string;
+  album_title: string;
+  folder_path: string;
+  year?: number | null;
+  genre?: string | null;
+  label?: string | null;
+  track_count: number;
+  metadata_source?: string | null;
+  score: number;
+  category: string;
+  reasons: string[];
+  signals: TrashReleaseSignal[];
+  has_cover?: boolean;
+  thumb_url?: string | null;
+}
+
+export interface TrashReleaseCandidatesResponse {
+  available: boolean;
+  reason?: string | null;
+  generated_at: number;
+  total: number;
+  summary: {
+    by_category: Record<string, number>;
+    top_score: number;
+  };
+  candidates: TrashReleaseCandidate[];
+}
+
+export interface TrashReleaseActionResult {
+  success: boolean;
+  action: 'move_to_dupes' | 'delete_from_disk';
+  action_id?: number;
+  album_id: number;
+  artist: string;
+  album_title: string;
+  from: string;
+  to?: string | null;
+  message: string;
+}
+
+export interface AdminOpsStorageTarget {
+  path: string;
+  probe_path: string;
+  exists: boolean;
+  total_bytes: number;
+  used_bytes: number;
+  free_bytes: number;
+}
+
+export interface AdminOpsBackupEntry {
+  name: string;
+  path: string;
+  created_at: number;
+  size_bytes: number;
+  status: string;
+  pg_dump_included: boolean;
+  pg_dump_ok: boolean;
+}
+
+export interface AdminOpsSnapshot {
+  generated_at: number;
+  library_mode: string;
+  auth_bootstrap_required: boolean;
+  pipeline_bootstrap_required: boolean;
+  first_full_scan_id?: number;
+  first_full_completed_at?: number | null;
+  scan_running: boolean;
+  files_roots_configured: boolean;
+  config_dir: string;
+  backup_root: string;
+  workflow_mode?: string;
+  storage: {
+    config: AdminOpsStorageTarget;
+    music: AdminOpsStorageTarget;
+    dupes: AdminOpsStorageTarget;
+    pgdata: AdminOpsStorageTarget;
+  };
+  sqlite: {
+    settings_db: Record<string, unknown>;
+    state_db: Record<string, unknown>;
+    cache_db: Record<string, unknown>;
+  };
+  postgres: Record<string, unknown>;
+  redis: Record<string, unknown>;
+  media_cache: Record<string, unknown>;
+  managed_runtime?: Record<string, unknown>;
+  backups: AdminOpsBackupEntry[];
+}
+
+export interface AdminOpsBackupResult {
+  ok: boolean;
+  status: 'ok' | 'partial' | 'error' | string;
+  message: string;
+  backup_path: string;
+  manifest_path: string;
+  snapshot_path: string;
+  sqlite: Record<string, { ok: boolean; path: string; size_bytes: number; error?: string }>;
+  pg_dump: {
+    requested: boolean;
+    attempted: boolean;
+    ok: boolean;
+    path?: string;
+    error?: string;
+  };
+  backups: AdminOpsBackupEntry[];
+}
+
+export async function getTrashReleaseCandidates(limit = 24, minScore = 4): Promise<TrashReleaseCandidatesResponse> {
+  const params = new URLSearchParams();
+  params.set('limit', String(Math.max(1, Math.min(200, limit))));
+  params.set('min_score', String(Math.max(1, Math.min(20, minScore))));
+  return fetchApi<TrashReleaseCandidatesResponse>(`/api/tools/trash-releases?${params.toString()}`);
+}
+
+export async function applyTrashReleaseAction(
+  albumId: number,
+  action: 'move_to_dupes' | 'delete_from_disk',
+): Promise<TrashReleaseActionResult> {
+  return fetchApi<TrashReleaseActionResult>('/api/tools/trash-releases/action', {
+    method: 'POST',
+    body: JSON.stringify({
+      album_id: albumId,
+      action,
+    }),
+  });
+}
+
+export async function getAdminOpsSnapshot(): Promise<AdminOpsSnapshot> {
+  return fetchApi<AdminOpsSnapshot>('/api/admin/ops/snapshot');
+}
+
+export async function createAdminOpsBackup(includePgDump = true): Promise<AdminOpsBackupResult> {
+  return fetchApi<AdminOpsBackupResult>('/api/admin/ops/backup', {
+    method: 'POST',
+    body: JSON.stringify({ include_pg_dump: includePgDump }),
+  });
+}
+
 // Broken Albums API
 export interface BrokenAlbum {
   artist: string;
@@ -4285,41 +5472,96 @@ export interface BrokenAlbum {
   album_title: string;
   expected_track_count?: number;
   actual_track_count: number;
-  missing_indices: Array<[number, number]>;
+  missing_indices: Array<number | [number, number]>;
   musicbrainz_release_group_id?: string;
   detected_at: number;
-  sent_to_lidarr: boolean;
+  /** Compatibility name for older databases. Prefer sent_to_external_recovery in UI code. */
+  sent_to_lidarr?: boolean;
+  sent_to_external_recovery?: boolean;
+  folder_path?: string | null;
+  thumb_url?: string | null;
+  metadata_source?: string | null;
+  strict_match_provider?: string | null;
+  strict_reject_reason?: string | null;
+  reason_summary?: string | null;
+  classification?: string | null;
+  classification_confidence?: number;
+  classification_source?: string | null;
+  quarantine_eligible?: boolean;
+  evidence?: Record<string, unknown>;
+  ai_verdict?: BrokenAlbumAiVerdict;
+  pipeline_status?: string | null;
+  recoverable?: boolean;
+  review_status?: 'pending' | 'ignored' | null;
 }
 
-export interface LidarrConfig {
-  LIDARR_URL?: string;
-  LIDARR_API_KEY?: string;
+export interface BrokenAlbumDetailTrack {
+  title: string;
+  track_num?: number;
+  disc_num?: number;
+  disc_label?: string;
+  duration_sec?: number;
+  file_path?: string;
 }
 
-export async function testLidarr(url: string, apiKey: string): Promise<{ success: boolean; message: string }> {
-  const response = await fetchWithAuth('/api/lidarr/test', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url, api_key: apiKey }),
-  });
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ message: 'Failed to test Lidarr connection' }));
-    throw new Error(error.message || 'Failed to test Lidarr connection');
-  }
-  return response.json();
+export interface BrokenAlbumExpectedTrack {
+  index: number;
+  title: string;
 }
 
-export async function testAutobrr(url: string, apiKey: string): Promise<{ success: boolean; message: string }> {
-  const response = await fetchWithAuth('/api/autobrr/test', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url, api_key: apiKey }),
-  });
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ message: 'Failed to test Autobrr connection' }));
-    throw new Error(error.message || 'Failed to test Autobrr connection');
-  }
-  return response.json();
+export interface BrokenAlbumAiVerdict {
+  status?: 'completed' | 'failed' | 'skipped';
+  provider?: string;
+  model?: string;
+  shadow_mode?: boolean;
+  prompt_version?: string;
+  verdict?: string;
+  confidence?: number;
+  reasoning_flags?: string[];
+  recommended_action?: 'keep_review' | 'do_not_quarantine' | 'quarantine_candidate' | string;
+  needs_manual_review?: boolean;
+  evidence_summary?: string;
+  deterministic_verdict?: string;
+  deterministic_confidence?: number;
+  ai_overrides_deterministic?: boolean;
+  reason?: string;
+  error?: string;
+  created_at?: number;
+}
+
+export interface BrokenAlbumDetail {
+  artist: string;
+  album_id: number;
+  album_title: string;
+  detected_at: number;
+  folder_path?: string | null;
+  thumb_url?: string | null;
+  metadata_source?: string | null;
+  strict_match_provider?: string | null;
+  strict_reject_reason?: string | null;
+  expected_track_count?: number;
+  actual_track_count: number;
+  missing_indices: Array<number | [number, number]>;
+  missing_required_tags?: string[];
+  musicbrainz_release_group_id?: string | null;
+  provider_refs?: Record<string, string>;
+  pipeline_status?: string | null;
+  timeline?: unknown[];
+  meta_summary?: Record<string, unknown>;
+  reason_summary?: string | null;
+  classification?: string | null;
+  classification_confidence?: number;
+  classification_source?: string | null;
+  quarantine_eligible?: boolean;
+  evidence?: Record<string, unknown>;
+  ai_verdict?: BrokenAlbumAiVerdict;
+  local_tracks: BrokenAlbumDetailTrack[];
+  expected_tracks: BrokenAlbumExpectedTrack[];
+  recoverable: boolean;
+  /** Compatibility name for older databases. Prefer sent_to_external_recovery in UI code. */
+  sent_to_lidarr?: boolean;
+  sent_to_external_recovery?: boolean;
+  review_status?: 'pending' | 'ignored' | null;
 }
 
 export async function getBrokenAlbums(): Promise<BrokenAlbum[]> {
@@ -4328,20 +5570,36 @@ export async function getBrokenAlbums(): Promise<BrokenAlbum[]> {
   return response.json();
 }
 
-export async function addAlbumToLidarr(album: BrokenAlbum): Promise<{ success: boolean; message: string }> {
-  const response = await fetchWithAuth('/api/lidarr/add-album', {
+export async function getBrokenAlbumDetail(
+  artist: string,
+  albumId: number,
+  options?: { refreshAi?: boolean },
+): Promise<BrokenAlbumDetail> {
+  const q = new URLSearchParams({
+    artist,
+    album_id: String(Math.max(1, Math.floor(albumId))),
+  });
+  if (options?.refreshAi) q.set('refresh_ai', '1');
+  return fetchApi<BrokenAlbumDetail>(`/api/broken-albums/detail?${q.toString()}`, { timeoutMs: 25000 });
+}
+
+export async function setBrokenAlbumReviewStatus(
+  artist: string,
+  albumId: number,
+  reviewStatus: 'pending' | 'ignored',
+): Promise<{ success: boolean; artist: string; album_id: number; review_status: string }> {
+  const response = await fetchWithAuth('/api/broken-albums/review', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      artist_name: album.artist,
-      album_id: album.album_id,
-      musicbrainz_release_group_id: album.musicbrainz_release_group_id,
-      album_title: album.album_title,
+      artist,
+      album_id: albumId,
+      review_status: reviewStatus,
     }),
   });
   if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.message || 'Failed to add album to Lidarr');
+    const error = await response.json().catch(() => ({ error: 'Failed to update incomplete album review status' }));
+    throw new Error(error.error || error.message || 'Failed to update incomplete album review status');
   }
   return response.json();
 }

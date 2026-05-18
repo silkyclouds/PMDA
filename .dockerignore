@@ -18,6 +18,8 @@ frontend/.git
 pmda.log*
 .tmp
 .venv
+.venv-*
+.worktrees
 __pycache__
 .pytest_cache
 .mypy_cache

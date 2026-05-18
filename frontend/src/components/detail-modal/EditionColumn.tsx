@@ -111,14 +111,14 @@ export function EditionColumn({ edition, index, isSelected, totalEditions }: Edi
 
         {/* MusicBrainz ID */}
         {edition.musicbrainz_id && (
-          <div className="flex items-center gap-1.5 mt-2 p-2 rounded-md bg-blue-500/5 border border-blue-500/20">
-            <Database className="w-3 h-3 text-blue-500 shrink-0" />
+          <div className="flex items-center gap-1.5 mt-2 p-2 rounded-md bg-info/5 border border-info/20">
+            <Database className="w-3 h-3 text-info shrink-0" />
             <div className="flex-1 min-w-0">
-              <span className="text-[10px] text-blue-600 dark:text-blue-400 font-medium">MusicBrainz ID:</span>
+              <span className="text-[10px] text-info font-medium">MusicBrainz ID:</span>
               {edition.match_verified_by_ai && (
-                <span className="ml-1 text-[9px] text-green-600 dark:text-green-400 font-medium" title="Match chosen by AI verify">(verified by AI)</span>
+                <span className="ml-1 text-[9px] text-success font-medium" title="Match chosen by AI verify">(verified by AI)</span>
               )}
-              <code className="block text-[10px] text-blue-700 dark:text-blue-300 font-mono truncate mt-0.5" title={edition.musicbrainz_id}>
+              <code className="block text-[10px] text-info font-mono truncate mt-0.5" title={edition.musicbrainz_id}>
                 {edition.musicbrainz_id}
               </code>
             </div>

@@ -8,10 +8,17 @@ import { cn } from '@/lib/utils';
 
 interface LibraryEmptyStateProps {
   className?: string;
+  title?: string;
+  description?: string;
+  actionLabel?: string | null;
+  onAction?: (() => void) | null;
 }
 
-export function LibraryEmptyState({ className }: LibraryEmptyStateProps) {
+export function LibraryEmptyState({ className, title, description, actionLabel, onAction }: LibraryEmptyStateProps) {
   const { isAdmin } = useAuth();
+  const resolvedTitle = title || 'Library is empty';
+  const resolvedDescription = description || 'No artists, albums, or tracks are indexed yet. Run your first scan to populate the library.';
+  const showScanCta = !actionLabel;
 
   return (
     <Card className={cn('border-dashed border-border/70 bg-muted/20', className)}>
@@ -20,12 +27,17 @@ export function LibraryEmptyState({ className }: LibraryEmptyStateProps) {
           <Disc3 className="h-7 w-7 text-primary" />
         </div>
         <div className="space-y-1.5">
-          <h2 className="text-lg font-semibold text-foreground">Library is empty</h2>
-          <p className="text-sm text-muted-foreground">
-            No artists, albums, or tracks are indexed yet. Run your first scan to populate the library.
-          </p>
+          <h2 className="text-lg font-semibold text-foreground">{resolvedTitle}</h2>
+          <p className="text-sm text-muted-foreground">{resolvedDescription}</p>
         </div>
-        {isAdmin ? (
+        {actionLabel && onAction ? (
+          <div className="flex items-center justify-center">
+            <Button type="button" className="gap-2" onClick={onAction}>
+              <Disc3 className="h-4 w-4" />
+              {actionLabel}
+            </Button>
+          </div>
+        ) : showScanCta && isAdmin ? (
           <div className="flex items-center justify-center">
             <Button asChild className="gap-2">
               <Link to="/scan">

@@ -11,6 +11,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
+import { AlbumMatchSources } from '@/components/library/AlbumMatchSources';
 import { EntityDiscoverDialog } from '@/components/library/EntityDiscoverDialog';
 import { GridSizeControl } from '@/components/library/GridSizeControl';
 import { SocialActivityBadges } from '@/components/social/SocialActivityBadges';
@@ -61,7 +62,15 @@ interface AlbumInfo {
   thumb?: string;
   format?: string;
   is_lossless?: boolean;
+  sample_rate?: number | null;
+  bit_depth?: number | null;
   mb_identified?: boolean;
+  musicbrainz_release_group_id?: string | null;
+  discogs_release_id?: string | null;
+  lastfm_album_mbid?: string | null;
+  bandcamp_album_url?: string | null;
+  metadata_source?: string | null;
+  strict_match_provider?: string | null;
   short_description?: string;
   user_rating?: number | null;
   public_rating?: number | null;
@@ -69,6 +78,9 @@ interface AlbumInfo {
   public_rating_source?: string | null;
   heat_score?: number | null;
   classical?: api.ClassicalIdentityPayload | null;
+  artist_roles?: string[] | null;
+  artist_is_primary?: boolean;
+  appears_on?: boolean;
 }
 
 interface ArtistDetailResponse {
@@ -77,6 +89,7 @@ interface ArtistDetailResponse {
   created_at?: number | null;
   updated_at?: number | null;
   artist_thumb?: string;
+  artist_has_image?: boolean;
   albums: AlbumInfo[];
   total_albums: number;
   artist_profile?: ArtistProfile;
@@ -92,6 +105,7 @@ interface ArtistProfileResponse {
 
 const albumTypeOrder = ['Album', 'EP', 'Single', 'Compilation', 'Anthology'];
 const classicalCatalogGroupKey = '__classical_works__';
+const appearsOnGroupKey = '__appears_on__';
 
 function wordCount(text: string): number {
   const t = (text || '').trim();
@@ -168,14 +182,14 @@ export default function ArtistPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const { startPlayback, setCurrentTrack } = usePlayback();
-  const { canUseAI } = useAuth();
+  const { canUseAI, user } = useAuth();
   const { showBadges, setShowBadges } = useAlbumBadgesVisibility();
   const { tileSize, setTileSize } = useLibraryTileSize();
   const params = useParams<{ artistId: string }>();
   const artistId = Number(params.artistId);
   const { toast } = useToast();
   const autoAiRequestedRef = useRef(false);
-  const similarRefreshAttemptsRef = useRef(0);
+  const similarWarmupArtistIdRef = useRef<number | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [details, setDetails] = useState<ArtistDetailResponse | null>(null);
@@ -213,7 +227,11 @@ export default function ArtistPage() {
     return txt || 'unknown error';
   }, []);
 
-  const fetchArtist = useCallback(async () => {
+  useEffect(() => {
+    similarWarmupArtistIdRef.current = null;
+  }, [artistId]);
+
+  const fetchArtist = useCallback(async (refresh = false) => {
     if (!Number.isFinite(artistId) || artistId <= 0) {
       setError('Invalid artist id');
       setLoading(false);
@@ -222,7 +240,8 @@ export default function ArtistPage() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(appendIncludeUnmatched(`/api/library/artist/${artistId}`));
+      const suffix = refresh ? `${appendIncludeUnmatched(`/api/library/artist/${artistId}`)}&refresh=1` : appendIncludeUnmatched(`/api/library/artist/${artistId}`);
+      const res = await fetch(suffix);
       if (!res.ok) throw new Error('Failed to load artist');
       const data = (await res.json()) as ArtistDetailResponse;
       setDetails(data);
@@ -330,31 +349,17 @@ export default function ArtistPage() {
   }, [connectionDetailsOpen, factsLoadedOnce, factsLoading, loadFacts]);
 
   useEffect(() => {
-    let cancelled = false;
-    const run = async () => {
-      try {
-        const cfg = await api.getConfig();
-        if (cancelled) return;
-        const enabled = Boolean(cfg.CONCERTS_FILTER_ENABLED);
-        const lat = cfg.CONCERTS_HOME_LAT != null ? Number(String(cfg.CONCERTS_HOME_LAT).trim()) : NaN;
-        const lon = cfg.CONCERTS_HOME_LON != null ? Number(String(cfg.CONCERTS_HOME_LON).trim()) : NaN;
-        const radius = cfg.CONCERTS_RADIUS_KM != null ? Number(String(cfg.CONCERTS_RADIUS_KM).trim()) : NaN;
-        setConcertFilter({
-          enabled,
-          lat: Number.isFinite(lat) ? lat : null,
-          lon: Number.isFinite(lon) ? lon : null,
-          radiusKm: Number.isFinite(radius) && radius > 0 ? radius : 150,
-        });
-      } catch {
-        if (cancelled) return;
-        setConcertFilter(null);
-      }
-    };
-    void run();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    const enabled = Boolean(user?.concerts_filter_enabled ?? false);
+    const lat = user?.concerts_home_lat != null ? Number(String(user.concerts_home_lat).trim()) : NaN;
+    const lon = user?.concerts_home_lon != null ? Number(String(user.concerts_home_lon).trim()) : NaN;
+    const radius = user?.concerts_radius_km != null ? Number(String(user.concerts_radius_km).trim()) : NaN;
+    setConcertFilter({
+      enabled,
+      lat: Number.isFinite(lat) ? lat : null,
+      lon: Number.isFinite(lon) ? lon : null,
+      radiusKm: Number.isFinite(radius) && radius > 0 ? radius : 150,
+    });
+  }, [user?.concerts_filter_enabled, user?.concerts_home_lat, user?.concerts_home_lon, user?.concerts_radius_km]);
 
   useEffect(() => {
     let cancelled = false;
@@ -449,7 +454,7 @@ export default function ArtistPage() {
     autoAiRequestedRef.current = false;
     try {
       await Promise.allSettled([
-        fetchArtist(),
+        fetchArtist(true),
         fetchProfile(true),
         loadConcerts(true),
       ]);
@@ -528,7 +533,7 @@ export default function ArtistPage() {
       }
 
       const postTasks: Promise<unknown>[] = [
-        fetchArtist(),
+        fetchArtist(false),
         fetchProfile(false),
         loadSummary(),
       ];
@@ -597,9 +602,10 @@ export default function ArtistPage() {
 
   useEffect(() => {
     if (!details) return;
+    if (similarWarmupArtistIdRef.current === details.artist_id) return;
+
+    similarWarmupArtistIdRef.current = details.artist_id;
     let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    similarRefreshAttemptsRef.current = 0;
     const run = async () => {
       try {
         const res = await fetch(appendIncludeUnmatched(`/api/library/artist/${details.artist_id}/similar`));
@@ -632,16 +638,6 @@ export default function ArtistPage() {
             })
             .filter((entry) => entry.name.length > 0)
         setFallbackSimilar(normalized);
-
-        // If some images are missing, the backend may be warming external caches asynchronously.
-        // Re-fetch a couple times so the grid upgrades itself without a manual refresh.
-        if (similarRefreshAttemptsRef.current < 3) {
-          const missingCount = normalized.filter((a) => !a.image_url || isProbablyPlaceholderArtistImageUrl(a.image_url)).length;
-          if (missingCount > 0) {
-            similarRefreshAttemptsRef.current += 1;
-            timer = setTimeout(run, 1800);
-          }
-        }
       } catch {
         // no-op
       }
@@ -649,7 +645,6 @@ export default function ArtistPage() {
     run();
     return () => {
       cancelled = true;
-      if (timer) clearTimeout(timer);
     };
   }, [appendIncludeUnmatched, details]);
 
@@ -672,7 +667,17 @@ export default function ArtistPage() {
     const src = details?.albums ?? [];
     const map: Record<string, AlbumInfo[]> = {};
     for (const album of src) {
-      const t = isPureClassicalCatalog ? classicalCatalogGroupKey : (album.type || 'Album');
+      const isAppearsOn = Boolean(
+        album.appears_on
+        || (
+          !album.artist_is_primary
+          && (album.artist_roles || []).some((role) => role === 'featured' || role === 'appearance')
+          && !(album.artist_roles || []).includes('artist')
+        ),
+      );
+      const t = isAppearsOn
+        ? appearsOnGroupKey
+        : (isPureClassicalCatalog ? classicalCatalogGroupKey : (album.type || 'Album'));
       if (!map[t]) map[t] = [];
       map[t].push(album);
     }
@@ -683,6 +688,8 @@ export default function ArtistPage() {
     return Object.keys(grouped).sort((a, b) => {
       const normalizedA = a === classicalCatalogGroupKey ? 'Album' : a;
       const normalizedB = b === classicalCatalogGroupKey ? 'Album' : b;
+      if (a === appearsOnGroupKey && b !== appearsOnGroupKey) return 1;
+      if (b === appearsOnGroupKey && a !== appearsOnGroupKey) return -1;
       const ai = albumTypeOrder.indexOf(normalizedA);
       const bi = albumTypeOrder.indexOf(normalizedB);
       if (ai === -1 && bi === -1) return a.localeCompare(b);
@@ -752,7 +759,7 @@ export default function ArtistPage() {
 
   const tags = (profile?.tags || []).slice(0, 8);
   const similar = ((fallbackSimilar && fallbackSimilar.length > 0) ? fallbackSimilar : (profile?.similar_artists || [])).slice(0, 12);
-  const heroImage = details.artist_thumb || null;
+  const heroImage = details.artist_thumb || details.albums.find((album) => album.thumb)?.thumb || null;
   const profileText = (
     profile?.bio
     || profile?.short_bio
@@ -874,10 +881,10 @@ export default function ArtistPage() {
                 className="absolute inset-0 h-full w-full object-cover blur-[1.8px] scale-[1.04]"
               />
             ) : (
-              <div className="absolute inset-0 bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900" />
+              <div className="absolute inset-0 bg-gradient-to-br from-muted via-muted/70 to-accent/20" />
             )}
             <div className="absolute inset-0 z-10 bg-background/34 backdrop-blur-xl" />
-            <div className="absolute inset-0 z-10 bg-gradient-to-r from-white/86 via-white/48 to-white/16 dark:from-background dark:via-background/92 dark:to-background/70" />
+            <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/86 via-background/48 to-background/16" />
             <div className="absolute inset-0 z-10 bg-gradient-to-t from-background/76 via-transparent to-transparent" />
             <div className="relative z-20 flex min-h-[24rem] items-end p-6 md:min-h-[30rem] md:p-8">
               <div className="grid grid-cols-1 md:grid-cols-[19rem,minmax(0,1fr)] xl:grid-cols-[21rem,minmax(0,1fr)] gap-8 md:gap-14 w-full items-center">
@@ -894,11 +901,11 @@ export default function ArtistPage() {
                     </div>
                   )}
                 </div>
-                <div className="min-w-0 md:pl-2 border border-border/70 bg-white/52 px-5 py-5 backdrop-blur-md dark:border-white/10 dark:bg-background/58">
-                  <h1 className="pr-2 pt-1 text-2xl font-bold tracking-tight leading-[1.02] text-slate-950 [text-wrap:balance] break-words drop-shadow-[0_1px_4px_rgba(255,255,255,0.55)] dark:text-white dark:drop-shadow-[0_2px_10px_rgba(0,0,0,0.55)] sm:text-3xl md:text-[2.9rem] md:leading-[0.98] xl:text-5xl xl:leading-[1.01]">
+                <div className="min-w-0 md:pl-2 border border-border/70 bg-card/80 px-5 py-5 backdrop-blur-md">
+                  <h1 className="pr-2 pt-1 text-2xl font-bold tracking-tight leading-[1.02] text-foreground [text-wrap:balance] break-words sm:text-3xl md:text-[2.9rem] md:leading-[0.98] xl:text-5xl xl:leading-[1.01]">
                     {details.artist_name}
                   </h1>
-                  <p className="mt-1.5 text-base text-slate-800 dark:text-white/82">
+                  <p className="mt-1.5 text-base text-muted-foreground">
                     {catalogCountLabel}
                   </p>
                   {tags.length > 0 && (
@@ -1302,7 +1309,9 @@ export default function ArtistPage() {
                 <div className="flex items-center gap-2">
                   <Disc3 className="w-4 h-4 text-primary" />
                   <h2 className="pmda-section-title">
-                    {type === classicalCatalogGroupKey ? 'Works' : (type === 'Single' ? 'Singles' : `${type}s`)}
+                    {type === appearsOnGroupKey
+                      ? 'Appears on'
+                      : (type === classicalCatalogGroupKey ? 'Works' : (type === 'Single' ? 'Singles' : `${type}s`))}
                   </h2>
                 </div>
               </div>
@@ -1357,6 +1366,11 @@ export default function ArtistPage() {
                           <h3 className="min-h-[3.6rem] text-sm font-semibold leading-snug line-clamp-3" title={album.title}>
                             {album.title}
                           </h3>
+                          {type === appearsOnGroupKey ? (
+                            <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+                              {(album.artist_roles || []).includes('featured') ? 'Featured appearance' : 'Appears on'}
+                            </p>
+                          ) : null}
                           {hasClassicalIdentity(album.classical) ? (
                             <div className="space-y-1">
                               {joinClassical(album.classical.work, 2) ? (
@@ -1381,6 +1395,7 @@ export default function ArtistPage() {
                               ) : null}
                             </div>
                           ) : null}
+                          <AlbumMatchSources album={album} />
                           <AlbumBadgeGroups
                             show={showBadges}
                             compact
@@ -1389,6 +1404,8 @@ export default function ArtistPage() {
                             publicRatingVotes={album.public_rating_votes}
                             format={album.format}
                             isLossless={album.is_lossless}
+                            sampleRate={album.sample_rate}
+                            bitDepth={album.bit_depth}
                             year={album.year || album.date || null}
                             trackCount={album.track_count}
                             genres={album.genres || (album.genre ? [album.genre] : [])}
@@ -1470,7 +1487,7 @@ export default function ArtistPage() {
 	                          loading="lazy"
 	                        />
 	                      ) : (
-	                        <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-amber-500/30 via-slate-500/10 to-emerald-500/30 text-lg font-semibold text-foreground/80">
+	                        <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-primary/20 via-muted to-accent/30 text-lg font-semibold text-foreground/80">
 	                          {initialsFromName(artist.name)}
 	                        </div>
 	                      )}

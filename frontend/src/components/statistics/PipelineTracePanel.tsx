@@ -58,23 +58,23 @@ function fmtDateTime(ts?: number | null): string {
 function statusTone(status: string): string {
   switch (status) {
     case 'matched':
-      return 'bg-emerald-500/15 text-emerald-200 border-emerald-500/40';
+      return 'bg-success/15 text-success border-success/40';
     case 'provider_only':
-      return 'bg-cyan-500/15 text-cyan-200 border-cyan-500/40';
+      return 'bg-info/15 text-info border-info/40';
     case 'unmatched':
-      return 'bg-zinc-500/15 text-zinc-200 border-zinc-500/40';
+      return 'bg-muted/15 text-muted-foreground border-border';
     case 'duplicate_winner':
     case 'restored_duplicate':
-      return 'bg-indigo-500/15 text-indigo-200 border-indigo-500/40';
+      return 'bg-primary/15 text-primary border-primary/40';
     case 'duplicate_loser':
     case 'moved_duplicate':
-      return 'bg-amber-500/15 text-amber-200 border-amber-500/40';
+      return 'bg-warning/15 text-warning border-warning/40';
     case 'duplicate_candidate':
-      return 'bg-orange-500/15 text-orange-200 border-orange-500/40';
+      return 'bg-warning/15 text-warning border-warning/40';
     case 'incomplete':
     case 'moved_incomplete':
     case 'restored_incomplete':
-      return 'bg-red-500/15 text-red-200 border-red-500/40';
+      return 'bg-destructive/15 text-destructive border-destructive/40';
     default:
       return 'bg-muted/40 text-muted-foreground border-border';
   }
@@ -85,7 +85,7 @@ function tinyBadge(label: string, active = false) {
     <Badge
       key={label}
       variant="outline"
-      className={active ? 'border-cyan-400/50 bg-cyan-500/10 text-cyan-100' : 'border-border/70 bg-background/60 text-muted-foreground'}
+      className={active ? 'border-info/50 bg-info/10 text-info' : 'border-border/70 bg-background/60 text-muted-foreground'}
     >
       {label}
     </Badge>
@@ -103,27 +103,27 @@ function providerSet(row: ScanPipelineTraceRow) {
 
 function qualityBadges(row: ScanPipelineTraceRow) {
   const out = [
-    <Badge key="cover" variant="outline" className={row.has_cover ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200' : 'border-red-500/40 bg-red-500/10 text-red-200'}>
+    <Badge key="cover" variant="outline" className={row.has_cover ? 'border-success/40 bg-success/10 text-success' : 'border-destructive/40 bg-destructive/10 text-destructive'}>
       {row.has_cover ? 'Cover' : 'No cover'}
     </Badge>,
   ];
   if ((row.missing_required_tags || []).length > 0) {
     out.push(
-      <Badge key="tags" variant="outline" className="border-amber-500/40 bg-amber-500/10 text-amber-200">
+      <Badge key="tags" variant="outline" className="border-warning/40 bg-warning/10 text-warning">
         {row.missing_required_tags.length} tag(s) missing
       </Badge>,
     );
   }
   if (row.is_broken) {
     out.push(
-      <Badge key="broken" variant="outline" className="border-red-500/40 bg-red-500/10 text-red-200">
+      <Badge key="broken" variant="outline" className="border-destructive/40 bg-destructive/10 text-destructive">
         Incomplete {row.actual_track_count || 0}/{row.expected_track_count || 0}
       </Badge>,
     );
   }
   if (row.ai_used) {
     out.push(
-      <Badge key="ai" variant="outline" className="border-violet-500/40 bg-violet-500/10 text-violet-200">
+      <Badge key="ai" variant="outline" className="border-primary/40 bg-primary/10 text-primary">
         AI {row.ai_provider || row.ai_model || 'used'}
       </Badge>,
     );
@@ -135,7 +135,7 @@ function duplicateBadges(row: ScanPipelineTraceRow) {
   const out: JSX.Element[] = [];
   if (row.dupe_role && row.dupe_role !== 'none') {
     out.push(
-      <Badge key="role" variant="outline" className="border-indigo-500/40 bg-indigo-500/10 text-indigo-200">
+      <Badge key="role" variant="outline" className="border-primary/40 bg-primary/10 text-primary">
         {row.dupe_role.replace(/_/g, ' ')}
       </Badge>,
     );
@@ -149,14 +149,14 @@ function duplicateBadges(row: ScanPipelineTraceRow) {
   }
   if (row.move_reason && row.move_reason !== 'none' && row.move_status && row.move_status !== 'none') {
     out.push(
-      <Badge key="move" variant="outline" className="border-emerald-500/40 bg-emerald-500/10 text-emerald-200">
+      <Badge key="move" variant="outline" className="border-success/40 bg-success/10 text-success">
         {row.move_status} {row.move_reason}
       </Badge>,
     );
   }
   if (row.manual_review) {
     out.push(
-      <Badge key="review" variant="outline" className="border-orange-500/40 bg-orange-500/10 text-orange-200">
+      <Badge key="review" variant="outline" className="border-warning/40 bg-warning/10 text-warning">
         Review
       </Badge>,
     );
@@ -357,12 +357,12 @@ export function PipelineTracePanel({ history, liveScanId, liveScanActive }: Pipe
                         <Badge variant="outline" className={statusTone(row.pipeline_status)}>{row.pipeline_status.replace(/_/g, ' ')}</Badge>
                         <div className="flex flex-wrap gap-1.5">
                           {row.strict_match_verified && (
-                            <Badge variant="outline" className="border-emerald-500/40 bg-emerald-500/10 text-emerald-200">
+                            <Badge variant="outline" className="border-success/40 bg-success/10 text-success">
                               Strict via {row.strict_match_provider || row.metadata_source || 'provider'}
                             </Badge>
                           )}
                           {!row.strict_match_verified && row.metadata_source && (
-                            <Badge variant="outline" className="border-cyan-500/40 bg-cyan-500/10 text-cyan-200">
+                            <Badge variant="outline" className="border-info/40 bg-info/10 text-info">
                               {row.metadata_source}
                             </Badge>
                           )}
@@ -373,7 +373,7 @@ export function PipelineTracePanel({ history, liveScanId, liveScanActive }: Pipe
                           ) : null}
                         </div>
                         {row.strict_reject_reason ? (
-                          <p className="text-[11px] text-amber-200">{row.strict_reject_reason}</p>
+                          <p className="text-[11px] text-warning">{row.strict_reject_reason}</p>
                         ) : null}
                       </div>
                     </TableCell>

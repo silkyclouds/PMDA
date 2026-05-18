@@ -50,6 +50,16 @@ docker run -d \
 | `/cache` | SSD/NVMe media cache for artwork and derived assets |
 | `/export` | Clean generated library for Plex/Jellyfin/Navidrome or direct use |
 
+### Optional Unraid power saver mount
+
+For Disk-aware power saver scans on Unraid, add a read-only host mount:
+
+| Mount | Purpose |
+|---|---|
+| `/host_mnt` | Read-only view of host `/mnt`, used to scan `/host_mnt/diskN/...` one source disk at a time |
+
+This mount is optional and the feature is disabled by default. Do not add Docker socket access or privileged mode for it.
+
 ---
 
 ## 3. Essential Environment Variables
@@ -243,8 +253,29 @@ Recommended Unraid mappings:
 - `/config` -> appdata or another persistent system path
 - `/cache` -> SSD/NVMe path
 - `/music` -> your source library root(s)
+- `/host_mnt` -> `/mnt` read-only if you want Disk-aware power saver scans
 - `/dupes` -> review/quarantine path
 - `/export` -> optional generated clean library root
+
+### Disk-aware power saver scan
+
+Advanced Settings includes an optional **Disk-aware power saver scan** section. v1 is Unraid-only and strict: one source disk active at a time.
+
+Default values:
+
+| Setting | Default |
+|---|---|
+| `STORAGE_POWER_SAVER_ENABLED` | `false` |
+| `STORAGE_PROVIDER` | `unraid` |
+| `UNRAID_HOST_MNT_ROOT` | `/host_mnt` |
+| `UNRAID_USER_SHARE_HOST_ROOT` | `/host_mnt/user/MURRAY/Music` |
+| `UNRAID_CONTAINER_SHARE_ROOT` | `/music` |
+| `STORAGE_MAX_ACTIVE_DEVICES` | `1` |
+| `STORAGE_SPINDOWN_POLICY` | `none` |
+
+When enabled, PMDA validates the mapping before scanning and refuses to start if `/host_mnt/disk*` or the `/music` -> `/host_mnt/user/...` relationship is invalid. It does not silently fall back to `/mnt/user`, because that would wake the array again.
+
+Full operational notes: [Unraid Disk-Aware Power Saver Scan](UNRAID_POWER_SAVER_SCAN.md).
 
 Recommended template philosophy:
 

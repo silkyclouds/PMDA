@@ -53,22 +53,41 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const initialize = useCallback(async () => {
     setIsLoading(true);
-    try {
-      const status = await api.getAuthBootstrapStatus();
-      const required = Boolean(status?.bootstrap_required);
-      setBootstrapRequired(required);
-      if (required) {
-        api.clearAuthToken();
-        setUser(null);
-        return;
+
+    const doInit = async () => {
+      try {
+        const status = await api.getAuthBootstrapStatus();
+        const required = Boolean(status?.bootstrap_required);
+        setBootstrapRequired(required);
+        if (required) {
+          api.clearAuthToken();
+          setUser(null);
+          return;
+        }
+        await refreshSession();
+      } catch {
+        setBootstrapRequired(false);
+        await refreshSession();
       }
-      await refreshSession();
-    } catch {
-      setBootstrapRequired(false);
-      await refreshSession();
-    } finally {
-      setIsLoading(false);
+    };
+
+    // In the Lovable preview environment (no real PMDA backend), the fetch proxy
+    // can hang indefinitely. Apply a hard timeout so the UI still renders.
+    // This guard ONLY activates when running inside a *.lovableproject.com or
+    // *.lovable.app preview. Real PMDA deployments are unaffected.
+    const isLovablePreview =
+      typeof window !== 'undefined' &&
+      (window.location.hostname.endsWith('.lovableproject.com') ||
+        window.location.hostname.endsWith('.lovable.app'));
+
+    if (isLovablePreview) {
+      const timeout = new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 5000));
+      await Promise.race([doInit(), timeout]);
+    } else {
+      await doInit();
     }
+
+    setIsLoading(false);
   }, [refreshSession]);
 
   useEffect(() => {

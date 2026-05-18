@@ -21,7 +21,7 @@ type ApiErrorShape = {
 };
 
 export function useDuplicates(options?: { refetchInterval?: number; source?: 'scan' | 'all' }) {
-  const source = options?.source ?? 'scan';
+  const source = options?.source ?? 'all';
   return useQuery<DuplicateCard[], Error>({
     queryKey: ['duplicates', source],
     queryFn: () => api.getDuplicates({ source }),

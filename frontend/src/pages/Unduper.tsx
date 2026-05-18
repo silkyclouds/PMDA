@@ -87,11 +87,10 @@ export default function Unduper() {
   const [reviewMovesFilter, setReviewMovesFilter] = useState<'all' | 'active' | 'restored'>('all');
   const [selectedReviewMove, setSelectedReviewMove] = useState<ScanMove | null>(null);
 
-  // Data hooks (refetch duplicates every 2s during scan so list grows as artists finish, 1s during dedupe)
+  // Data hooks. The review list is global by design; current scans append to it.
   const { progress: scanProgress, dedupeProgress } = useScanProgressShared({ pollInterval: 2500 });
-  const duplicateSource: 'scan' | 'all' = (scanProgress?.scanning || dedupeProgress?.deduping) ? 'scan' : 'all';
   const { data: duplicates = [], isLoading: loadingDuplicates } = useDuplicates({
-    source: duplicateSource,
+    source: 'all',
     refetchInterval: scanProgress?.scanning ? 3500 : dedupeProgress?.deduping ? 2000 : 12000,
   });
   const { data: libraryStats, error: libraryStatsError } = useQuery({
@@ -178,6 +177,11 @@ export default function Unduper() {
     [dedupeMovesForReviewAll],
   );
   const hasReviewHistory = Boolean(reviewScanId && dedupeMovesForReviewAll.length > 0);
+  const scanDuplicateGroupsCount = Math.max(0, Number(scanProgress?.duplicate_groups_count || 0));
+  const scanDuplicateLosersCount = Math.max(0, Number(scanProgress?.total_duplicates_count || 0));
+  const hasLiveDuplicateSignal = Boolean(
+    scanProgress?.scanning && (scanDuplicateGroupsCount > 0 || scanDuplicateLosersCount > 0),
+  );
 
   // Dedupe handlers
   const handleDedupeSingle = useCallback(
@@ -569,20 +573,22 @@ export default function Unduper() {
             <Loader2 className="w-5 h-5 shrink-0 animate-spin text-primary" />
             <div className="flex-1 min-w-0">
               <p className="text-sm font-medium text-foreground">
-                Scan in progress…
+                {hasLiveDuplicateSignal ? 'Duplicate groups detected during scan…' : 'Scan in progress…'}
               </p>
               <p className="text-xs text-muted-foreground mt-0.5 tabular-nums">
                 {(scanProgress?.artists_processed ?? 0).toLocaleString()} / {(scanProgress?.artists_total ?? 0).toLocaleString()} artists
-                {(scanProgress?.duplicate_groups_count ?? 0) > 0 && (
-                  <> · <span className="font-medium text-foreground">{(scanProgress?.duplicate_groups_count ?? 0).toLocaleString()} duplicate group(s) so far</span></>
+                {scanDuplicateGroupsCount > 0 && (
+                  <> · <span className="font-medium text-foreground">{scanDuplicateGroupsCount.toLocaleString()} duplicate group(s) so far</span></>
                 )}
+                {scanDuplicateLosersCount > 0 ? ` · ${scanDuplicateLosersCount.toLocaleString()} loser edition(s)` : ''}
+                {hasLiveDuplicateSignal ? ' · review rows are still committing' : ''}
               </p>
             </div>
           </div>
         )}
 
         {/* Empty state */}
-        {!loadingDuplicates && filteredDuplicates.length === 0 && !hasReviewHistory && (
+        {!loadingDuplicates && filteredDuplicates.length === 0 && !hasReviewHistory && !(scanProgress?.scanning ?? false) && (
           <EmptyState
             onStartScan={scanControls.start}
             isScanning={scanProgress?.scanning ?? false}

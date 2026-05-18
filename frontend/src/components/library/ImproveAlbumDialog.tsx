@@ -92,7 +92,7 @@ export function ImproveAlbumDialog({ open, onOpenChange, albumId, albumTitle, on
         )}
         {result != null && (
           <>
-            <div className="rounded-lg border border-green-200 bg-green-50 dark:border-green-800 dark:bg-green-950/50 p-3 text-sm font-medium text-foreground">
+            <div className="rounded-lg border border-success/30 bg-success/10 p-3 text-sm font-medium text-foreground">
               {result.summary}
             </div>
             {result.steps.length > 0 && (

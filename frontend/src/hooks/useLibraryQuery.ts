@@ -1,5 +1,6 @@
 import { useCallback, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import type { LibraryBrowseScope } from '@/lib/api';
 
 export interface LibraryQueryState {
   search: string;
@@ -7,6 +8,7 @@ export interface LibraryQueryState {
   label: string;
   year: number | null;
   includeUnmatched: boolean | null;
+  scope: LibraryBrowseScope;
 }
 
 function parseYear(raw: string | null): number | null {
@@ -23,6 +25,12 @@ function parseBoolParam(raw: string | null): boolean | null {
   return null;
 }
 
+function parseScope(raw: string | null): LibraryBrowseScope {
+  const value = String(raw || '').trim().toLowerCase();
+  if (value === 'inbox' || value === 'dupes' || value === 'all') return value;
+  return 'library';
+}
+
 export function useLibraryQuery() {
   const [sp, setSp] = useSearchParams();
 
@@ -33,6 +41,7 @@ export function useLibraryQuery() {
       label: (sp.get('label') || '').trim(),
       year: parseYear(sp.get('year')),
       includeUnmatched: parseBoolParam(sp.get('include_unmatched')),
+      scope: parseScope(sp.get('scope')),
     };
   }, [sp]);
 
@@ -63,6 +72,11 @@ export function useLibraryQuery() {
         const v = updates.includeUnmatched;
         if (v == null) next.delete('include_unmatched');
         else next.set('include_unmatched', v ? '1' : '0');
+      }
+      if (updates.scope !== undefined) {
+        const v = parseScope(String(updates.scope || 'library'));
+        if (v === 'library') next.delete('scope');
+        else next.set('scope', v);
       }
       setSp(next, { replace: Boolean(opts?.replace) });
     },

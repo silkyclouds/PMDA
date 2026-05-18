@@ -38,10 +38,10 @@ export default function BootstrapAdminPage() {
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-amber-50 via-orange-50 to-stone-100 p-6 md:p-10">
+    <div className="min-h-screen bg-gradient-to-br from-background via-background to-muted p-4 sm:p-6 md:p-10">
       <div className="mx-auto flex min-h-[80vh] w-full max-w-lg items-center">
-        <Card className="w-full shadow-sm">
-          <CardHeader className="space-y-4">
+        <Card className="w-full shadow-sm border-border/60">
+          <CardHeader className="space-y-4 px-5 sm:px-6">
             <div className="flex justify-center">
               <img
                 src="/pmda-logo-mute-v1-transparent-cropped.png"
@@ -57,7 +57,7 @@ export default function BootstrapAdminPage() {
               First run detected. Create the initial administrator account.
             </CardDescription>
           </CardHeader>
-          <CardContent>
+          <CardContent className="px-5 sm:px-6 pb-6">
             <form onSubmit={onSubmit} className="space-y-4">
               <div className="space-y-2">
                 <Label htmlFor="bootstrap-username">Admin username</Label>

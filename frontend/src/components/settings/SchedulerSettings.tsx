@@ -36,7 +36,7 @@ const QUICK_POST_JOBS: Array<{ jobType: TaskJobType; label: string; description:
   { jobType: 'dedupe', label: 'Dedupe', description: 'Move duplicate loser albums.', defaultScope: 'both' },
   { jobType: 'incomplete_move', label: 'Incomplete move', description: 'Move incomplete albums to target folder.', defaultScope: 'new' },
   { jobType: 'export', label: 'Export', description: 'Rebuild exported clean library.', defaultScope: 'both' },
-  { jobType: 'player_sync', label: 'Player sync', description: 'Trigger Plex/Jellyfin/Navidrome refresh.', defaultScope: 'both' },
+  { jobType: 'player_sync', label: 'Player sync', description: 'Trigger Jellyfin/Navidrome refresh.', defaultScope: 'both' },
 ];
 
 interface SchedulerSettingsProps {
@@ -423,7 +423,7 @@ export function SchedulerSettings({ config, updateConfig }: SchedulerSettingsPro
                   <p className="text-xs text-muted-foreground">Watcher status unavailable.</p>
                 )}
                 {watcherDegraded ? (
-                  <div className="flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                  <div className="flex items-center gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
                     <AlertTriangle className="h-4 w-4" />
                     Watcher degraded: changed-only uses discovery fallback.
                   </div>

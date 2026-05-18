@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
 import { Heart, Loader2, Play, UserRound } from 'lucide-react';
 
@@ -8,6 +8,8 @@ import { Card } from '@/components/ui/card';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { LibraryLiveStateBadges } from '@/components/library/LibraryLiveStateBadges';
+import { AlbumMatchSources } from '@/components/library/AlbumMatchSources';
 import { GridSizeControl } from '@/components/library/GridSizeControl';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { usePlayback } from '@/contexts/PlaybackContext';
@@ -16,7 +18,7 @@ import { getLibraryGridTemplateColumns, useLibraryTileSize } from '@/hooks/use-l
 import { useToast } from '@/hooks/use-toast';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import { useIsMobile } from '@/hooks/use-mobile';
-import { dedupeAlbumsForDisplay, mergeAlbumsForDisplay } from '@/lib/albumDisplayDedupe';
+import { albumDisplayIdentity, countNewAlbumsById, dedupeAlbumsForDisplay, mergeAlbumsForDisplay } from '@/lib/albumDisplayDedupe';
 import { withBackLinkState } from '@/lib/backNavigation';
 import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
@@ -29,17 +31,20 @@ export default function LibraryAlbums() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
   const location = useLocation();
-  const { includeUnmatched, libraryIsEmpty } = useOutletContext<LibraryOutletContext>();
+  const { includeUnmatched, scope, libraryIsEmpty, emptyState, setScope } = useOutletContext<LibraryOutletContext>();
   const { toast } = useToast();
   const { startPlayback, setCurrentTrack } = usePlayback();
   const { showBadges, setShowBadges } = useAlbumBadgesVisibility();
-  const { search, genre, label, year } = useLibraryQuery();
+  const { search, genre, label, year, patch } = useLibraryQuery();
 
   const [albumLoading, setAlbumLoading] = useState(false);
   const [albumError, setAlbumError] = useState<string | null>(null);
   const [albums, setAlbums] = useState<api.LibraryAlbumItem[]>([]);
   const [totalAlbums, setTotalAlbums] = useState(0);
+  const [hasMoreAlbums, setHasMoreAlbums] = useState(true);
+  const [paginationState, setPaginationState] = useState<'idle' | 'all_loaded' | 'no_new' | 'page_error'>('idle');
   const [appending, setAppending] = useState(false);
+  const [genres, setGenres] = useState<api.LibraryFacetItem[]>([]);
 
   const [albumLikes, setAlbumLikes] = useState<Record<number, boolean>>({});
 
@@ -53,10 +58,15 @@ export default function LibraryAlbums() {
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const loadingMoreRef = useRef(false);
   const albumLikesRef = useRef<Record<number, boolean>>({});
+  const albumsRef = useRef<api.LibraryAlbumItem[]>([]);
 
   useEffect(() => {
     albumLikesRef.current = albumLikes;
   }, [albumLikes]);
+
+  useEffect(() => {
+    albumsRef.current = albums;
+  }, [albums]);
 
   const gridTemplateColumns = useMemo(() => {
     if (isMobile) return 'repeat(2, minmax(0, 1fr))';
@@ -94,45 +104,77 @@ export default function LibraryAlbums() {
     }
   }, [albumLikes, toast]);
 
-  const fetchAlbums = useCallback(async (opts: { reset: boolean; pageOffset: number }) => {
+  const fetchAlbums = useCallback(async (opts: { reset: boolean; pageOffset: number; refresh?: boolean; pageLimit?: number; silent?: boolean }) => {
     const rid = ++requestIdRef.current;
     try {
-      if (opts.reset) {
+      if (opts.reset && !opts.silent) {
         setAlbumLoading(true);
         setAlbumError(null);
       }
       const data = await api.getLibraryAlbums({
         search: search.trim() || undefined,
         sort,
-        limit,
+        limit: opts.pageLimit ?? limit,
         offset: opts.pageOffset,
         genre: genre || undefined,
         label: label || undefined,
         year: year ?? undefined,
         includeUnmatched,
+        scope,
+        refresh: opts.refresh ?? false,
       });
       if (rid !== requestIdRef.current) return;
       const listRaw = Array.isArray(data.albums) ? data.albums : [];
       const list = dedupeAlbumsForDisplay(listRaw);
-      setTotalAlbums(typeof data.total === 'number' ? data.total : 0);
-      setAlbums((prev) => {
-        if (opts.reset) return list;
-        return mergeAlbumsForDisplay(prev, list);
+      const totalNext = typeof data.total === 'number' ? data.total : 0;
+      const responseHasMore = typeof data.has_more === 'boolean'
+        ? data.has_more
+        : (opts.pageOffset + listRaw.length) < totalNext;
+      const previousAlbums = opts.reset ? [] : albumsRef.current;
+      const newVisibleAlbums = opts.reset ? list.length : countNewAlbumsById(previousAlbums, list);
+      const nextAlbums = opts.reset ? list : mergeAlbumsForDisplay(previousAlbums, list);
+      albumsRef.current = nextAlbums;
+      const nextOffset = opts.pageOffset + listRaw.length;
+      const nextHasMore = Boolean(responseHasMore && listRaw.length > 0 && (opts.reset || newVisibleAlbums > 0));
+      startTransition(() => {
+        setAlbumError(null);
+        setTotalAlbums(totalNext);
+        setAlbums(nextAlbums);
+        setOffset(nextOffset);
+        setHasMoreAlbums(nextHasMore);
+        setPaginationState(
+          nextHasMore
+            ? 'idle'
+            : (!opts.reset && responseHasMore && listRaw.length > 0 && newVisibleAlbums <= 0)
+              ? 'no_new'
+              : 'all_loaded'
+        );
       });
-      setOffset(opts.pageOffset + listRaw.length);
       void hydrateAlbumLikes(list.map((a) => a.album_id));
     } catch (e) {
       if (rid !== requestIdRef.current) return;
-      setAlbumError(e instanceof Error ? e.message : 'Failed to load albums');
-      if (opts.reset) {
-        setAlbums([]);
-        setOffset(0);
-        setTotalAlbums(0);
+      if (!opts.silent && opts.reset) {
+        setAlbumError(e instanceof Error ? e.message : 'Failed to load albums');
+      }
+      if (opts.reset && !opts.silent) {
+        startTransition(() => {
+          albumsRef.current = [];
+          setAlbums([]);
+          setOffset(0);
+          setTotalAlbums(0);
+          setHasMoreAlbums(false);
+          setPaginationState('idle');
+        });
+      } else if (!opts.reset) {
+        startTransition(() => {
+          setHasMoreAlbums(false);
+          setPaginationState('page_error');
+        });
       }
     } finally {
-      if (rid === requestIdRef.current) setAlbumLoading(false);
+      if (rid === requestIdRef.current && !opts.silent) setAlbumLoading(false);
     }
-  }, [genre, hydrateAlbumLikes, includeUnmatched, label, limit, search, sort, year]);
+  }, [genre, hydrateAlbumLikes, includeUnmatched, label, limit, scope, search, sort, year]);
 
   useEffect(() => {
     try {
@@ -143,14 +185,41 @@ export default function LibraryAlbums() {
   }, [sort]);
 
   useEffect(() => {
+    let cancelled = false;
+    api.getLibraryGenres({
+      label: label || undefined,
+      year: year ?? undefined,
+      includeUnmatched,
+      scope,
+      limit: 120,
+    })
+      .then((res) => {
+        if (cancelled) return;
+        setGenres(Array.isArray(res.genres) ? res.genres : []);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setGenres([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [includeUnmatched, label, scope, year]);
+
+  useEffect(() => {
     if (libraryIsEmpty) {
+      albumsRef.current = [];
       setAlbums([]);
       setOffset(0);
       setTotalAlbums(0);
+      setHasMoreAlbums(false);
+      setPaginationState('idle');
       setAlbumLoading(false);
       return;
     }
     setOffset(0);
+    setHasMoreAlbums(true);
+    setPaginationState('idle');
     void fetchAlbums({ reset: true, pageOffset: 0 });
   }, [search, genre, label, year, sort, includeUnmatched, fetchAlbums, libraryIsEmpty]);
 
@@ -176,7 +245,7 @@ export default function LibraryAlbums() {
     }
   };
 
-  const canLoadMore = offset < totalAlbums && !albumLoading;
+  const canLoadMore = hasMoreAlbums && offset < totalAlbums && !albumLoading;
   const loadMore = useCallback(async () => {
     if (!canLoadMore || loadingMoreRef.current) return;
     loadingMoreRef.current = true;
@@ -210,7 +279,12 @@ export default function LibraryAlbums() {
   if (libraryIsEmpty) {
     return (
       <div className="pmda-library-shell pb-6">
-        <LibraryEmptyState />
+        <LibraryEmptyState
+          title={emptyState.title}
+          description={emptyState.description}
+          actionLabel={emptyState.actionLabel ?? undefined}
+          onAction={emptyState.actionScope ? () => setScope(emptyState.actionScope as api.LibraryBrowseScope) : undefined}
+        />
       </div>
     );
   }
@@ -220,8 +294,8 @@ export default function LibraryAlbums() {
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
         <div className="space-y-1">
           <h1 className="pmda-page-title">Albums</h1>
-          <div className="text-xs text-muted-foreground">
-            {totalAlbums > 0 ? `${albums.length.toLocaleString()} / ${totalAlbums.toLocaleString()}` : ' '}
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <span>{totalAlbums > 0 ? `${albums.length.toLocaleString()} / ${totalAlbums.toLocaleString()}` : ' '}</span>
           </div>
         </div>
 
@@ -250,6 +324,29 @@ export default function LibraryAlbums() {
             </SelectContent>
           </Select>
 
+          <Select
+            value={genre || '__all__'}
+            onValueChange={(value) => patch({ genre: value === '__all__' ? '' : value }, { replace: true })}
+          >
+            <SelectTrigger className="w-full sm:w-[220px] h-10 bg-background/80">
+              <SelectValue placeholder="All genres" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__all__">All genres</SelectItem>
+              {genres.map((item) => (
+                <SelectItem key={`album-genre-${item.value}`} value={item.value}>
+                  {item.value} ({item.count})
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          {genre ? (
+            <Button type="button" variant="ghost" size="sm" className="h-10 px-3" onClick={() => patch({ genre: '' }, { replace: true })}>
+              Clear genre
+            </Button>
+          ) : null}
+
           <GridSizeControl value={tileSize} onChange={setTileSize} className="w-full sm:w-[260px]" />
         </div>
       </div>
@@ -262,7 +359,7 @@ export default function LibraryAlbums() {
 
       <div className="grid gap-4 justify-start" style={{ gridTemplateColumns }}>
         {albums.map((a, idx) => (
-          <div key={`alb-${a.album_id}`} className="group">
+          <div key={`alb-${albumDisplayIdentity(a)}`} className="group">
             <div className={cn(
               'relative overflow-hidden border border-border/60 bg-card'
             )}>
@@ -281,7 +378,7 @@ export default function LibraryAlbums() {
                 }}
               >
                 <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={512} priority={idx < 24} />
-                <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-black/35" />
+                <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-foreground/30" />
                 <div className="absolute top-2 right-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                   <Button
                     type="button"
@@ -325,6 +422,8 @@ export default function LibraryAlbums() {
                   >
                     {a.artist_name}
                   </button>
+                  <AlbumMatchSources album={a} className="pt-0.5" />
+                  <LibraryLiveStateBadges item={a} maxBadges={3} className="pt-1" />
                 </div>
 
                 <AlbumBadgeGroups
@@ -335,6 +434,8 @@ export default function LibraryAlbums() {
                   publicRatingVotes={a.public_rating_votes}
                   format={a.format}
                   isLossless={a.is_lossless}
+                  sampleRate={a.sample_rate}
+                  bitDepth={a.bit_depth}
                   year={a.year}
                   trackCount={a.track_count}
                   genres={a.genres || (a.genre ? [a.genre] : [])}
@@ -360,7 +461,15 @@ export default function LibraryAlbums() {
 
       <div ref={sentinelRef} className="h-8" />
       <div className="flex items-center justify-center py-2 text-xs text-muted-foreground">
-        {appending ? <span className="inline-flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading more…</span> : null}
+        {appending ? (
+          <span className="inline-flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading more…</span>
+        ) : paginationState === 'page_error' ? (
+          <span>Could not load the next page. Refresh to retry.</span>
+        ) : paginationState === 'no_new' ? (
+          <span>No more unique albums.</span>
+        ) : totalAlbums > 0 && !canLoadMore ? (
+          <span>All loaded</span>
+        ) : null}
       </div>
     </div>
   );

@@ -10,6 +10,7 @@ import { GridSizeControl } from '@/components/library/GridSizeControl';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
+import { AlbumMatchSources } from '@/components/library/AlbumMatchSources';
 import { ShareDialog } from '@/components/social/ShareDialog';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { getLibraryGridTemplateColumns, useLibraryTileSize } from '@/hooks/use-library-tile-size';
@@ -26,7 +27,7 @@ export default function GenrePage() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
   const location = useLocation();
-  const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
+  const { includeUnmatched, scope } = useOutletContext<LibraryOutletContext>();
   const { startPlayback, setCurrentTrack } = usePlayback();
   const { toast } = useToast();
   const { tileSize, setTileSize } = useLibraryTileSize();
@@ -84,11 +85,11 @@ export default function GenrePage() {
     try {
       setProfileLoading(true);
       const [profRes, labelsRes] = await Promise.all([
-        api.getGenreProfile(genre, { includeUnmatched, limit_artists: 24 }),
+        api.getGenreProfile(genre, { includeUnmatched, limit_artists: 24, scope }),
         (async () => {
           setLabelsLoading(true);
           try {
-            return await api.getLibraryGenreLabels(genre, 120, false, { includeUnmatched });
+            return await api.getLibraryGenreLabels(genre, 120, false, { includeUnmatched, scope });
           } finally {
             setLabelsLoading(false);
           }
@@ -102,7 +103,7 @@ export default function GenrePage() {
     } finally {
       setProfileLoading(false);
     }
-  }, [genre, includeUnmatched]);
+  }, [genre, includeUnmatched, scope]);
 
   const loadAlbumsPage = useCallback(async (opts: { reset: boolean; pageOffset: number }) => {
     const rid = ++requestIdRef.current;
@@ -114,7 +115,7 @@ export default function GenrePage() {
       } else {
         setAppending(true);
       }
-      const res = await api.getLibraryAlbums({ genre, sort: 'year_desc', limit, offset: pageOffset, includeUnmatched });
+      const res = await api.getLibraryAlbums({ genre, sort: 'year_desc', limit, offset: pageOffset, includeUnmatched, scope });
       if (rid !== requestIdRef.current) return;
       const listRaw = Array.isArray(res.albums) ? res.albums : [];
       const list = dedupeAlbumsForDisplay(listRaw);
@@ -138,7 +139,7 @@ export default function GenrePage() {
         setAppending(false);
       }
     }
-  }, [genre, includeUnmatched, limit]);
+  }, [genre, includeUnmatched, limit, scope]);
 
   useEffect(() => {
     if (!genre) {
@@ -360,7 +361,7 @@ export default function GenrePage() {
                 <div className="pmda-flat-tile relative overflow-hidden">
                   <AspectRatio ratio={1} className="bg-muted">
                     <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={320} imageClassName="w-full h-full object-cover" />
-                    <div className="absolute inset-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/25" />
+                    <div className="absolute inset-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-foreground/25" />
                     <div className="absolute inset-x-0 bottom-0 p-3 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                       <div className="flex items-center justify-between gap-2">
                         <Button
@@ -405,6 +406,7 @@ export default function GenrePage() {
                     >
                       {a.artist_name}
                     </button>
+                    <AlbumMatchSources album={a} className="pt-0.5" />
                     <AlbumBadgeGroups
                       show
                       compact
@@ -413,6 +415,8 @@ export default function GenrePage() {
                       publicRatingVotes={a.public_rating_votes}
                       format={a.format}
                       isLossless={a.is_lossless}
+                      sampleRate={a.sample_rate}
+                      bitDepth={a.bit_depth}
                       year={a.year}
                       trackCount={a.track_count}
                       genres={a.genres || (a.genre ? [a.genre] : [])}

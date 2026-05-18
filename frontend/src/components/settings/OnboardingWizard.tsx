@@ -1,0 +1,3604 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import {
+  AlertTriangle,
+  ArrowRight,
+  CheckCircle2,
+  ChevronDown,
+  ExternalLink,
+  FolderOutput,
+  Globe,
+  Loader2,
+  PlayCircle,
+  Plus,
+  RefreshCw,
+  Server,
+  Sparkles,
+  Trash2,
+  Workflow,
+} from 'lucide-react';
+import { toast } from 'sonner';
+
+import * as api from '@/lib/api';
+import type {
+  BootstrapStatus,
+  ManagedRuntimeBundleStatus,
+  ManagedRuntimeStatusResponse,
+  PMDAConfig,
+  ScanPreflightResult,
+  ScanProgress,
+} from '@/lib/api';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
+import { ScanBehaviorSettingsPanel } from '@/components/settings/SystemSettingsPanels';
+import { FolderBrowserInput } from '@/components/settings/FolderBrowserInput';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { PasswordInput } from '@/components/ui/password-input';
+import { Progress } from '@/components/ui/progress';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { Switch } from '@/components/ui/switch';
+
+type Props = {
+  config: Partial<PMDAConfig>;
+  updateConfig: (updates: Partial<PMDAConfig>) => void;
+  configured?: boolean;
+  presentation?: 'embedded' | 'modal';
+  dirty?: boolean;
+  isSaving?: boolean;
+  onSave?: () => Promise<boolean>;
+  onClose?: () => void;
+  onOpenGuidedSetup?: () => void;
+};
+
+type WorkflowMode = NonNullable<PMDAConfig['LIBRARY_WORKFLOW_MODE']>;
+type StackMode = 'online' | 'local';
+type ExternalAiProvider = 'openai-api' | 'anthropic' | 'google';
+type StepId = 'workflow' | 'folders' | 'metadata' | 'runtime' | 'sources' | 'rules' | 'pipeline' | 'scan_behavior' | 'review';
+type MatchPolicy = 'soft' | 'perfect';
+type DedupeMode = 'ignore' | 'detect' | 'move';
+type DedupeFormatStrategy = 'quality' | 'balanced' | 'compact';
+type DedupeSensitivity = 'safe' | 'aggressive';
+type IncompleteMode = 'keep' | 'obvious' | 'strict';
+type TagWriteMode = 'full' | 'pmda_id_only';
+type ProviderStatus = {
+  variant: 'default' | 'secondary' | 'outline' | 'destructive';
+  label: string;
+  message: string;
+};
+
+type Blocker = {
+  key: string;
+  title: string;
+  detail: string;
+  sectionId?: string;
+  stepId?: StepId;
+};
+
+type ManagedRuntimeLogEntry = {
+  log_id: number;
+  bundle_type: string;
+  service_name: string;
+  level: string;
+  message: string;
+  created_at: number;
+};
+
+const STEP_ORDER: Array<{ id: StepId; label: string; title: string }> = [
+  { id: 'workflow', label: 'Step 1', title: 'Workflow' },
+  { id: 'folders', label: 'Step 2', title: 'Folders' },
+  { id: 'metadata', label: 'Step 3', title: 'Metadata mode' },
+  { id: 'runtime', label: 'Step 4', title: 'Runtime / AI' },
+  { id: 'sources', label: 'Step 5', title: 'Metadata sources' },
+  { id: 'rules', label: 'Step 6', title: 'Rules' },
+  { id: 'pipeline', label: 'Step 7', title: 'Pipeline' },
+  { id: 'scan_behavior', label: 'Step 8', title: 'Scan behavior' },
+  { id: 'review', label: 'Step 9', title: 'Review' },
+];
+
+const FORMAT_PRESET_QUALITY = ['dsf', 'aif', 'aiff', 'wav', 'flac', 'alac', 'ape', 'm4a', 'mp4', 'ogg', 'opus', 'mp3', 'wma', 'aac'];
+const FORMAT_PRESET_BALANCED = ['flac', 'alac', 'wav', 'aif', 'aiff', 'dsf', 'm4a', 'ogg', 'opus', 'mp3', 'aac', 'ape', 'wma', 'mp4'];
+const FORMAT_PRESET_COMPACT = ['opus', 'ogg', 'aac', 'm4a', 'mp3', 'flac', 'alac', 'wav', 'aif', 'aiff', 'dsf', 'ape', 'wma', 'mp4'];
+
+const WORKFLOW_OPTIONS: Array<{
+  value: WorkflowMode;
+  label: string;
+  modeName: string;
+  description: string;
+  whenToUse: string;
+  asksFor: string;
+  diagram: string[];
+}> = [
+  {
+    value: 'managed',
+    label: 'Sort new arrivals',
+    modeName: 'Managed',
+    description: 'Recommended. New albums land in an intake folder first, then PMDA builds the clean library separately.',
+    whenToUse: 'You have one folder for new arrivals and another one for the final clean library.',
+    asksFor: 'PMDA will ask for: intake folder, clean library, dupes, incomplete albums.',
+    diagram: ['New arrivals', 'PMDA sorts', 'Final library'],
+  },
+  {
+    value: 'mirror',
+    label: 'Build a clean copy',
+    modeName: 'Mirror',
+    description: 'Use this if you already have a source library and want a separate clean copy.',
+    whenToUse: 'Your current library stays untouched. PMDA writes the cleaned result somewhere else.',
+    asksFor: 'PMDA will ask for: source library, clean library, dupes, incomplete albums.',
+    diagram: ['Current library', 'PMDA checks', 'Clean copy'],
+  },
+  {
+    value: 'inplace',
+    label: 'Use the current library',
+    modeName: 'In place',
+    description: 'Use this if the folder you already have is the final library.',
+    whenToUse: 'PMDA works directly in the current library. No second clean library is created.',
+    asksFor: 'PMDA will ask for: current library, dupes, incomplete albums.',
+    diagram: ['Current library', 'PMDA checks', 'Serve here'],
+  },
+  {
+    value: 'audit',
+    label: 'Audit existing library',
+    modeName: 'Audit',
+    description: 'Read-only. PMDA scans the current library, detects dupes and incompletes, and enriches the database view without automatic file changes.',
+    whenToUse: 'Use this if you want visibility and manual review first before letting PMDA move, retag, or publish anything.',
+    asksFor: 'PMDA will ask for: current library, dupes, incomplete albums.',
+    diagram: ['Current library', 'PMDA audits', 'Manual actions'],
+  },
+];
+
+const EXTERNAL_AI_OPTIONS: Array<{
+  value: ExternalAiProvider;
+  label: string;
+  description: string;
+  docsUrl: string;
+  docsLabel: string;
+}> = [
+  {
+    value: 'openai-api',
+    label: 'OpenAI',
+    description: 'Best when you want the broadest model choice and the smoothest validation path.',
+    docsUrl: 'https://platform.openai.com/api-keys',
+    docsLabel: 'Create API key',
+  },
+  {
+    value: 'anthropic',
+    label: 'Anthropic',
+    description: 'Useful if Claude is already your paid provider for higher-context reasoning.',
+    docsUrl: 'https://console.anthropic.com/settings/keys',
+    docsLabel: 'Create API key',
+  },
+  {
+    value: 'google',
+    label: 'Google',
+    description: 'Useful if Gemini is already your paid provider and you want one billing surface.',
+    docsUrl: 'https://aistudio.google.com/app/apikey',
+    docsLabel: 'Create API key',
+  },
+];
+
+const METADATA_SOURCE_LINKS = {
+  discogs: 'https://www.discogs.com/settings/developers',
+  lastfm: 'https://www.last.fm/api/account/create',
+  acoustid: 'https://acoustid.org/new-application',
+  fanart: 'https://fanart.tv/get-an-api-key/',
+  audiodb: 'https://www.theaudiodb.com/api_apply.php',
+  serper: 'https://serper.dev',
+} as const;
+
+const MATERIALIZATION_OPTIONS: Array<{
+  value: NonNullable<PMDAConfig['EXPORT_LINK_STRATEGY']>;
+  label: string;
+  description: string;
+}> = [
+  { value: 'hardlink', label: 'Hardlink', description: 'Fastest and usually the best default. No extra copy if the filesystem supports it.' },
+  { value: 'symlink', label: 'Symlink', description: 'Keeps references to original files. Useful when hardlinks are not appropriate.' },
+  { value: 'copy', label: 'Copy', description: 'Safest but duplicates data on disk.' },
+  { value: 'move', label: 'Move', description: 'Relocates files physically into the published library.' },
+];
+
+const PLAYER_TARGET_OPTIONS: Array<{
+  value: NonNullable<PMDAConfig['PIPELINE_PLAYER_TARGET']>;
+  label: string;
+  description: string;
+}> = [
+  { value: 'none', label: 'Not now', description: 'Skip player sync for the first scan.' },
+  { value: 'plex', label: 'Plex', description: 'Refresh Plex after the pipeline completes.' },
+  { value: 'jellyfin', label: 'Jellyfin', description: 'Refresh Jellyfin after the pipeline completes.' },
+  { value: 'navidrome', label: 'Navidrome', description: 'Refresh Navidrome after the pipeline completes.' },
+];
+
+const LOCAL_STACK_RECOMMENDED_FREE_GB = 40;
+const MANAGED_RUNTIME_ACTIVE_STATES = new Set(['preflight', 'pulling', 'creating', 'importing', 'waiting_health', 'updating']);
+const DEFAULT_OLLAMA_FAST_MODEL = 'qwen3:4b';
+const DEFAULT_OLLAMA_HARD_MODEL = 'qwen3:14b';
+const LEGACY_OLLAMA_FAST_DEFAULT = 'qwen2.5:3b-instruct';
+const LEGACY_OLLAMA_HARD_DEFAULT = 'qwen2.5:14b-instruct';
+const RECOVERABLE_MUSICBRAINZ_BOOTSTRAP_ERRORS = [
+  'Provision script not found:',
+  'Missing required command: curl',
+  'Command failed (1): /app/scripts/provision_musicbrainz_mirror_unraid.sh',
+];
+
+function normalizeFolderPath(input: string): string {
+  const raw = String(input || '').trim();
+  if (!raw) return '';
+  if (raw === '/') return '/';
+  return raw.replace(/\/+$/, '') || raw;
+}
+
+function parsePathList(value: unknown): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const queue: unknown[] = [value];
+
+  while (queue.length > 0) {
+    const item = queue.shift();
+    if (item == null) continue;
+    if (Array.isArray(item)) {
+      queue.push(...item);
+      continue;
+    }
+    if (typeof item === 'string') {
+      const s = item.trim();
+      if (!s) continue;
+      if (s.startsWith('[') || s.startsWith('"')) {
+        try {
+          const parsed = JSON.parse(s) as unknown;
+          if (parsed !== item) {
+            queue.push(parsed);
+            continue;
+          }
+        } catch {
+          // fall through
+        }
+      }
+      if (s.includes(',')) {
+        const parts = s.split(',').map((part) => part.trim()).filter(Boolean);
+        if (parts.length > 1) {
+          queue.push(...parts);
+          continue;
+        }
+      }
+      const normalized = normalizeFolderPath(s);
+      if (normalized && !seen.has(normalized)) {
+        seen.add(normalized);
+        out.push(normalized);
+      }
+      continue;
+    }
+    const normalized = normalizeFolderPath(String(item));
+    if (normalized && !seen.has(normalized)) {
+      seen.add(normalized);
+      out.push(normalized);
+    }
+  }
+
+  return out;
+}
+
+function stringifyPathList(paths: string[]): string {
+  return paths
+    .map((path) => normalizeFolderPath(path))
+    .filter(Boolean)
+    .join(', ');
+}
+
+function normalizeFormatPreference(raw: unknown): string[] {
+  if (Array.isArray(raw)) {
+    return raw.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+  }
+  const text = String(raw || '').trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+    }
+  } catch {
+    // fall through
+  }
+  return text.split(',').map((value) => value.trim().toLowerCase()).filter(Boolean);
+}
+
+function isBundleReady(bundle: ManagedRuntimeBundleStatus | null | undefined): boolean {
+  if (!bundle) return false;
+  return bundle.state === 'ready' && Boolean(bundle.health?.available);
+}
+
+function bundleLatestActionStatus(bundle: ManagedRuntimeBundleStatus | null | undefined): string {
+  return String(bundle?.latest_action?.status || '').trim().toLowerCase();
+}
+
+function bundleFailureMessage(bundle: ManagedRuntimeBundleStatus | null | undefined): string {
+  return String(
+    bundle?.latest_action?.error
+    || bundle?.last_error
+    || bundle?.phase_message
+    || '',
+  ).trim();
+}
+
+function bundleHasRecoverableMusicBrainzFailure(bundle: ManagedRuntimeBundleStatus | null | undefined): boolean {
+  const text = bundleFailureMessage(bundle);
+  if (!text) return false;
+  return RECOVERABLE_MUSICBRAINZ_BOOTSTRAP_ERRORS.some((needle) => text.includes(needle));
+}
+
+function effectiveBundleState(bundle: ManagedRuntimeBundleStatus | null | undefined): string {
+  if (!bundle) return 'absent';
+  const state = String(bundle.state || '').trim().toLowerCase() || 'idle';
+  const latestStatus = bundleLatestActionStatus(bundle);
+  const hasReachableRuntime = Boolean(bundle.effective_url || bundle.health?.available);
+  if (
+    !hasReachableRuntime
+    && latestStatus === 'failed'
+    && (MANAGED_RUNTIME_ACTIVE_STATES.has(state) || state === 'failed')
+  ) {
+    return bundleHasRecoverableMusicBrainzFailure(bundle) ? 'idle' : 'failed';
+  }
+  return state;
+}
+
+function effectiveBundlePhase(bundle: ManagedRuntimeBundleStatus | null | undefined): string {
+  const state = effectiveBundleState(bundle);
+  if (state === 'idle' || state === 'failed' || state === 'ready') return state;
+  return String(bundle?.phase || '').trim().toLowerCase() || state;
+}
+
+function effectiveBundleMessage(
+  bundle: ManagedRuntimeBundleStatus | null | undefined,
+  fallbackIdleMessage = 'Not started yet.',
+): string {
+  if (!bundle) return fallbackIdleMessage;
+  const state = effectiveBundleState(bundle);
+  if (state === 'idle') return fallbackIdleMessage;
+  if (state === 'failed') return bundleFailureMessage(bundle) || 'Provisioning failed.';
+  return String(bundle.phase_message || '').trim() || fallbackIdleMessage;
+}
+
+function bundleModels(bundle: ManagedRuntimeBundleStatus | null | undefined): string[] {
+  const metaModels = Array.isArray(bundle?.meta?.models) ? bundle.meta.models : [];
+  const healthModels = Array.isArray(bundle?.health?.models) ? bundle.health.models : [];
+  return Array.from(new Set([...healthModels, ...metaModels].map((value) => String(value || '').trim()).filter(Boolean)));
+}
+
+function managedBundleProgress(
+  bundle: ManagedRuntimeBundleStatus | null | undefined,
+  options?: { requiredModels?: string[] },
+): number {
+  if (!bundle) return 0;
+  const mode = String(bundle.mode || '').trim().toLowerCase();
+  const requiredModels = options?.requiredModels || [];
+  const models = bundleModels(bundle);
+  const hasRequiredModels = requiredModels.length === 0 || requiredModels.every((model) => models.includes(model));
+  if (isBundleReady(bundle) && hasRequiredModels) return 100;
+
+  const state = effectiveBundleState(bundle);
+  const phase = effectiveBundlePhase(bundle);
+  const combined = `${state} ${phase}`;
+  const metaProgressRaw = Number((bundle.meta as Record<string, unknown> | undefined)?.progress);
+  if (Number.isFinite(metaProgressRaw) && metaProgressRaw > 0 && state !== 'idle' && state !== 'failed') {
+    return Math.max(0, Math.min(100, Math.round(metaProgressRaw)));
+  }
+
+  if (mode === 'absent' || state === 'idle' || combined.trim() === '') return 0;
+  if (combined.includes('failed')) return 100;
+  if (combined.includes('ready')) return hasRequiredModels ? 100 : 88;
+  if (combined.includes('pull')) return 40;
+  if (combined.includes('updat') || combined.includes('import')) return 58;
+  if (combined.includes('start') || combined.includes('wait')) return 76;
+  if (combined.includes('creat') || combined.includes('provision')) return 24;
+  if (combined.includes('preflight') || combined.includes('check')) return 18;
+  return 8;
+}
+
+function managedBundleDisplayProgress(
+  bundle: ManagedRuntimeBundleStatus | null | undefined,
+  options?: { requiredModels?: string[] },
+): number {
+  if (!bundle) return 0;
+  const meta = (bundle.meta || {}) as Record<string, unknown>;
+  if (bundle.bundle_type === 'musicbrainz_local' && effectiveBundlePhase(bundle) === 'importing') {
+    const rawDownloadProgress = Number(meta.download_progress);
+    if (Number.isFinite(rawDownloadProgress) && rawDownloadProgress > 0) {
+      return Math.max(0, Math.min(100, Math.round(rawDownloadProgress)));
+    }
+  }
+  return managedBundleProgress(bundle, options);
+}
+
+function hasManagedBundleStarted(bundle: ManagedRuntimeBundleStatus | null | undefined): boolean {
+  if (!bundle) return false;
+  if (bundle.effective_url || bundle.health?.available) return true;
+  const mode = String(bundle.mode || '').trim().toLowerCase();
+  const state = effectiveBundleState(bundle);
+  const phase = effectiveBundlePhase(bundle);
+  if (mode && mode !== 'absent') {
+    if ((state === 'idle' || state === 'failed') && !bundle.effective_url && !bundle.health?.available) {
+      return false;
+    }
+    return true;
+  }
+  if (state && state !== 'idle' && state !== 'absent') return true;
+  if (phase && phase !== 'idle') return true;
+  return false;
+}
+
+function formatEtaSeconds(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.round(Number(totalSeconds) || 0));
+  if (!seconds) return '';
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${secs}s`;
+  return `${secs}s`;
+}
+
+function managedBundleEta(bundle: ManagedRuntimeBundleStatus | null | undefined): string {
+  const meta = (bundle?.meta || {}) as Record<string, unknown>;
+  const explicit = String(meta.eta_text || '').trim();
+  if (explicit) return explicit;
+  const progress = Number(meta.progress);
+  const startedAt = Number(meta.started_at);
+  if (!Number.isFinite(progress) || progress <= 0 || progress >= 100 || !Number.isFinite(startedAt) || startedAt <= 0) {
+    return '';
+  }
+  const elapsed = Math.max(1, (Date.now() / 1000) - startedAt);
+  const remaining = elapsed * ((100 - progress) / progress);
+  return formatEtaSeconds(remaining);
+}
+
+function WorkflowDiagram({ nodes }: { nodes: string[] }) {
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+      {nodes.map((node, index) => (
+        <div key={node} className="flex items-center gap-2">
+          <span className="rounded-full border border-border/70 bg-background/70 px-3 py-1.5 font-medium text-foreground">
+            {node}
+          </span>
+          {index < nodes.length - 1 ? <ArrowRight className="h-3.5 w-3.5 text-primary/70" /> : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function managedBundleLabel(bundleType: string): string {
+  return bundleType === 'musicbrainz_local' ? 'MusicBrainz mirror' : 'Ollama';
+}
+
+function compactManagedLogMessage(message: string): string {
+  const raw = String(message || '').trim();
+  if (!raw) return '';
+  return raw
+    .replace(/^[A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4}\s*:\s*/g, '')
+    .replace(/^\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}\s*/g, '')
+    .replace(/^Command finished successfully\.\s*/i, 'Command finished successfully. ')
+    .trim();
+}
+
+function formatRuntimeLogTime(createdAt: number): string {
+  const value = Number(createdAt);
+  if (!Number.isFinite(value) || value <= 0) return '';
+  try {
+    return new Date(value * 1000).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+  } catch {
+    return '';
+  }
+}
+
+function normalizeExternalProvider(value: unknown): ExternalAiProvider {
+  const raw = String(value || '').trim().toLowerCase();
+  if (raw === 'anthropic' || raw === 'google') return raw;
+  return 'openai-api';
+}
+
+function providerCredential(config: Partial<PMDAConfig>, provider: ExternalAiProvider): string {
+  if (provider === 'anthropic') return String(config.ANTHROPIC_API_KEY || '').trim();
+  if (provider === 'google') return String(config.GOOGLE_API_KEY || '').trim();
+  return String(config.OPENAI_API_KEY || '').trim();
+}
+
+function workflowNeedsPublishedLibrary(mode: WorkflowMode): boolean {
+  return mode === 'managed' || mode === 'mirror';
+}
+
+function PathListEditor({
+  label,
+  description,
+  paths,
+  onChange,
+  placeholder,
+  selectLabel,
+  browseRoot,
+  lockToBrowseRoot = false,
+  allowManualEntry = true,
+}: {
+  label: string;
+  description: string;
+  paths: string[];
+  onChange: (paths: string[]) => void;
+  placeholder: string;
+  selectLabel: string;
+  browseRoot?: string;
+  lockToBrowseRoot?: boolean;
+  allowManualEntry?: boolean;
+}) {
+  const [draftPaths, setDraftPaths] = useState<string[]>(paths.length > 0 ? [...paths] : ['']);
+
+  useEffect(() => {
+    const normalizedIncoming = paths.map((path) => normalizeFolderPath(path)).filter(Boolean);
+    setDraftPaths((prev) => {
+      const normalizedPrev = prev.map((path) => normalizeFolderPath(path)).filter(Boolean);
+      return JSON.stringify(normalizedPrev) === JSON.stringify(normalizedIncoming)
+        ? prev
+        : (normalizedIncoming.length > 0 ? [...normalizedIncoming] : ['']);
+    });
+  }, [paths]);
+
+  const setPath = (index: number, value: string) => {
+    const next = [...draftPaths];
+    next[index] = normalizeFolderPath(value);
+    setDraftPaths(next);
+    onChange(next.filter(Boolean));
+  };
+
+  const addPath = () => {
+    if (draftPaths.every((value) => value.trim())) {
+      setDraftPaths([...draftPaths, '']);
+    }
+  };
+
+  const removePath = (index: number) => {
+    const next = [...draftPaths];
+    next.splice(index, 1);
+    const safeNext = next.length > 0 ? next : [''];
+    setDraftPaths(safeNext);
+    onChange(next.filter(Boolean));
+  };
+
+  return (
+    <div className="space-y-3 rounded-2xl border border-border/70 bg-background/50 p-4">
+      <div className="space-y-1">
+        <Label>{label}</Label>
+        <p className="text-xs text-muted-foreground">{description}</p>
+      </div>
+      <div className="space-y-2">
+        {draftPaths.map((path, index) => (
+          <div key={`${label}-${index}`} className="flex items-start gap-2">
+            <div className="min-w-0 flex-1">
+              <FolderBrowserInput
+                value={path}
+                onChange={(next) => setPath(index, next || '')}
+                placeholder={placeholder}
+                selectLabel={selectLabel}
+                compact
+                browseRoot={browseRoot}
+                lockToBrowseRoot={lockToBrowseRoot}
+                allowManualEntry={allowManualEntry}
+              />
+            </div>
+            {draftPaths.length > 1 ? (
+              <Button type="button" variant="outline" size="icon" className="mt-0.5 shrink-0" onClick={() => removePath(index)}>
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            ) : null}
+          </div>
+        ))}
+      </div>
+      <Button type="button" variant="outline" size="sm" className="gap-2" onClick={addPath}>
+        <Plus className="h-3.5 w-3.5" />
+        Add another folder
+      </Button>
+    </div>
+  );
+}
+
+function SingleFolderField({
+  label,
+  description,
+  value,
+  onChange,
+  placeholder,
+  selectLabel,
+  browseRoot,
+  lockToBrowseRoot = false,
+  allowManualEntry = true,
+}: {
+  label: string;
+  description: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+  selectLabel: string;
+  browseRoot?: string;
+  lockToBrowseRoot?: boolean;
+  allowManualEntry?: boolean;
+}) {
+  return (
+    <div className="space-y-3 rounded-2xl border border-border/70 bg-background/50 p-4">
+      <div className="space-y-1">
+        <Label>{label}</Label>
+        <p className="text-xs text-muted-foreground">{description}</p>
+      </div>
+      <FolderBrowserInput
+        value={value}
+        onChange={(next) => onChange(next || '')}
+        placeholder={placeholder}
+        selectLabel={selectLabel}
+        compact
+        browseRoot={browseRoot}
+        lockToBrowseRoot={lockToBrowseRoot}
+        allowManualEntry={allowManualEntry}
+      />
+    </div>
+  );
+}
+
+function scrollToSection(id: string): void {
+  const node = document.getElementById(id);
+  if (!node) return;
+  node.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+export function OnboardingWizard({
+  config,
+  updateConfig,
+  configured = false,
+  presentation = 'embedded',
+  dirty = false,
+  isSaving = false,
+  onSave,
+  onClose,
+  onOpenGuidedSetup,
+}: Props) {
+  const navigate = useNavigate();
+  const isModalPresentation = presentation === 'modal';
+  const [activeStep, setActiveStep] = useState<number>(0);
+  const [bootstrap, setBootstrap] = useState<BootstrapStatus | null>(null);
+  const [managedStatus, setManagedStatus] = useState<ManagedRuntimeStatusResponse | null>(null);
+  const [managedRuntimeLogs, setManagedRuntimeLogs] = useState<ManagedRuntimeLogEntry[]>([]);
+  const [providersPreflight, setProvidersPreflight] = useState<ScanPreflightResult | null>(null);
+  const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
+  const [statusLoading, setStatusLoading] = useState<boolean>(true);
+  const [providersChecking, setProvidersChecking] = useState<boolean>(false);
+  const [scanActionBusy, setScanActionBusy] = useState<boolean>(false);
+  const [runtimeActionBusy, setRuntimeActionBusy] = useState<boolean>(false);
+  const [localStackConfirmOpen, setLocalStackConfirmOpen] = useState<boolean>(false);
+  const [showRuntimeDetails, setShowRuntimeDetails] = useState<boolean>(false);
+  const [externalModels, setExternalModels] = useState<string[]>([]);
+  const [externalValidationState, setExternalValidationState] = useState<'idle' | 'loading' | 'valid' | 'error'>('idle');
+  const [externalValidationMessage, setExternalValidationMessage] = useState<string>('');
+  const [externalLocalStack, setExternalLocalStack] = useState<{
+    checked: boolean;
+    musicbrainzOk: boolean;
+    ollamaOk: boolean;
+    message: string;
+  }>({ checked: false, musicbrainzOk: false, ollamaOk: false, message: '' });
+  const [pipelineStepConfirmed, setPipelineStepConfirmed] = useState<boolean>(Boolean(configured));
+  const localStackAutoPromptedRef = useRef(false);
+  const [stackChoiceLocked, setStackChoiceLocked] = useState<boolean>(false);
+  const initializedDefaultsRef = useRef(false);
+  const providerValidationRequestRef = useRef(0);
+  const reviewFingerprintRef = useRef<string>('');
+
+  const inferredHost = typeof window !== 'undefined' ? window.location.hostname : '';
+  const inferredLocalHost = inferredHost && inferredHost !== 'localhost' && inferredHost !== '127.0.0.1'
+    ? inferredHost
+    : 'localhost';
+  const inferredLocalOllamaUrl = `http://${inferredLocalHost}:11434`;
+  const inferredLocalMusicbrainzUrl = `http://${inferredLocalHost}:5500`;
+  const isLocalhostUrl = (value: string) => {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) return true;
+    return normalized.includes('localhost') || normalized.includes('127.0.0.1') || normalized.includes('0.0.0.0');
+  };
+
+  const workflowMode = (config.LIBRARY_WORKFLOW_MODE || 'managed') as WorkflowMode;
+  const workflowMeta = useMemo(
+    () => WORKFLOW_OPTIONS.find((option) => option.value === workflowMode) || WORKFLOW_OPTIONS[0]!,
+    [workflowMode],
+  );
+
+  const intakeRoots = parsePathList(config.LIBRARY_INTAKE_ROOTS);
+  const sourceRoots = parsePathList(config.LIBRARY_SOURCE_ROOTS);
+  const servingRoot = String(config.LIBRARY_SERVING_ROOT || config.EXPORT_ROOT || '').trim();
+  const dupesRoot = String(config.LIBRARY_DUPES_ROOT || config.DUPE_ROOT || '').trim();
+  const incompleteRoot = String(config.LIBRARY_INCOMPLETE_ROOT || config.INCOMPLETE_ALBUMS_TARGET_DIR || '').trim();
+
+  const derivedStackMode: StackMode = useMemo(() => {
+    const aiProvider = String(config.AI_PROVIDER || '').trim().toLowerCase();
+    const webSearchProvider = String(config.WEB_SEARCH_PROVIDER || '').trim().toLowerCase();
+    if (config.MUSICBRAINZ_MIRROR_ENABLED || aiProvider === 'ollama' || webSearchProvider === 'ollama') {
+      return 'local';
+    }
+    if (
+      aiProvider === 'openai'
+      || aiProvider === 'openai-api'
+      || aiProvider === 'anthropic'
+      || aiProvider === 'google'
+      || Boolean(String(config.OPENAI_API_KEY || '').trim())
+      || Boolean(String(config.ANTHROPIC_API_KEY || '').trim())
+      || Boolean(String(config.GOOGLE_API_KEY || '').trim())
+    ) {
+      return 'online';
+    }
+    return 'local';
+  }, [config.AI_PROVIDER, config.ANTHROPIC_API_KEY, config.GOOGLE_API_KEY, config.MUSICBRAINZ_MIRROR_ENABLED, config.OPENAI_API_KEY, config.WEB_SEARCH_PROVIDER]);
+
+  const selectedStackMode: StackMode = stackChoiceLocked ? derivedStackMode : 'local';
+
+  const selectedExternalProvider = useMemo(
+    () => normalizeExternalProvider(config.AI_PROVIDER),
+    [config.AI_PROVIDER],
+  );
+
+  const rawOllamaUrl = String(config.OLLAMA_URL || '').trim();
+  const ollamaUrl = rawOllamaUrl && !isLocalhostUrl(rawOllamaUrl) ? rawOllamaUrl : inferredLocalOllamaUrl;
+  const rawOllamaModel = String(config.OLLAMA_MODEL || '').trim();
+  const rawOllamaHardModel = String(config.OLLAMA_COMPLEX_MODEL || '').trim();
+  const usesLegacyOllamaDefaults = rawOllamaModel === LEGACY_OLLAMA_FAST_DEFAULT
+    && rawOllamaHardModel === LEGACY_OLLAMA_HARD_DEFAULT;
+  const ollamaModel = usesLegacyOllamaDefaults
+    ? DEFAULT_OLLAMA_FAST_MODEL
+    : (rawOllamaModel || DEFAULT_OLLAMA_FAST_MODEL);
+  const ollamaHardModel = usesLegacyOllamaDefaults
+    ? DEFAULT_OLLAMA_HARD_MODEL
+    : (rawOllamaHardModel || DEFAULT_OLLAMA_HARD_MODEL);
+  const rawMusicbrainzBaseUrl = String(config.MUSICBRAINZ_BASE_URL || '').trim();
+  const musicbrainzBaseUrl = rawMusicbrainzBaseUrl
+    ? (isLocalhostUrl(rawMusicbrainzBaseUrl) ? inferredLocalMusicbrainzUrl : rawMusicbrainzBaseUrl)
+    : (selectedStackMode === 'local' ? inferredLocalMusicbrainzUrl : '');
+  const managedConfigRoot = String(config.MANAGED_RUNTIME_CONFIG_ROOT || '').trim();
+  const managedDataRoot = String(config.MANAGED_RUNTIME_DATA_ROOT || '').trim();
+  const resolvedManagedConfigRoot = managedConfigRoot || '/config/managed-runtime';
+  const resolvedManagedDataRoot = managedDataRoot || '/config/managed-runtime-data';
+  const managedMbBundle = managedStatus?.bundles?.musicbrainz_local || null;
+  const managedOllamaBundle = managedStatus?.bundles?.ollama_local || null;
+  const availableManagedModels = useMemo(() => bundleModels(managedOllamaBundle), [managedOllamaBundle]);
+  const managedMbCandidate = useMemo(
+    () => (managedMbBundle?.candidates || []).find((candidate) => Boolean(candidate.adoptable) && Boolean(candidate.health?.available)) || null,
+    [managedMbBundle],
+  );
+  const managedOllamaCandidate = useMemo(
+    () => (managedOllamaBundle?.candidates || []).find((candidate) => Boolean(candidate.adoptable)) || null,
+    [managedOllamaBundle],
+  );
+
+  const wantsPublishedLibrary = workflowNeedsPublishedLibrary(workflowMode);
+  const auditMode = workflowMode === 'audit';
+  const publishLibraryEnabled = wantsPublishedLibrary ? Boolean(config.PIPELINE_ENABLE_EXPORT) : false;
+  const materializationMode = (config.EXPORT_LINK_STRATEGY || config.LIBRARY_MATERIALIZATION_MODE || 'hardlink') as NonNullable<PMDAConfig['EXPORT_LINK_STRATEGY']>;
+  const formatPreference = useMemo(
+    () => normalizeFormatPreference(config.FORMAT_PREFERENCE).filter(Boolean),
+    [config.FORMAT_PREFERENCE],
+  );
+  const matchPolicy: MatchPolicy = Number(config.TRACKLIST_MATCH_MIN ?? 0.8) >= 0.97 ? 'perfect' : 'soft';
+  const dedupeMode: DedupeMode = !Boolean(config.PIPELINE_ENABLE_DEDUPE)
+    ? 'ignore'
+    : Boolean(config.AUTO_MOVE_DUPES)
+      ? 'move'
+      : 'detect';
+  const dedupeFormatStrategy: DedupeFormatStrategy = useMemo(() => {
+    const first = formatPreference[0] || '';
+    if (['opus', 'ogg', 'aac', 'mp3', 'm4a'].includes(first)) return 'compact';
+    if (first === 'flac' || first === 'alac') return 'balanced';
+    return 'quality';
+  }, [formatPreference]);
+  const dedupeSensitivity: DedupeSensitivity = String(config.LIVE_DEDUPE_MODE || 'safe').trim().toLowerCase() === 'aggressive'
+    ? 'aggressive'
+    : 'safe';
+  const incompleteMode: IncompleteMode = !Boolean(config.PIPELINE_ENABLE_INCOMPLETE_MOVE)
+    ? 'keep'
+    : (Number(config.BROKEN_ALBUM_CONSECUTIVE_THRESHOLD ?? 2) <= 1 || Number(config.BROKEN_ALBUM_PERCENTAGE_THRESHOLD ?? 0.25) <= 0.12)
+      ? 'strict'
+      : 'obvious';
+  const playerTarget = (Boolean(config.PIPELINE_ENABLE_PLAYER_SYNC)
+    ? (config.PIPELINE_PLAYER_TARGET || 'none')
+    : 'none') as NonNullable<PMDAConfig['PIPELINE_PLAYER_TARGET']>;
+  const tagWriteMode: TagWriteMode = String(config.FILES_TAG_WRITE_MODE || 'full').trim() === 'pmda_id_only'
+    ? 'pmda_id_only'
+    : 'full';
+  const tagWriteLabel = tagWriteMode === 'pmda_id_only' ? 'DB-only (PMDA ID only)' : 'Write tags into files';
+
+  const shouldFetchManagedCandidates = selectedStackMode === 'local'
+    && activeStep === 3
+    && !runtimeActionBusy;
+  const shouldFetchManagedLogs = selectedStackMode === 'local' && activeStep === 3 && showRuntimeDetails;
+  const shouldCheckExternalLocalStack = selectedStackMode === 'local'
+    && Boolean(musicbrainzBaseUrl || ollamaUrl);
+
+  const persistIfNeeded = useCallback(async () => {
+    if (!isModalPresentation || !dirty || !onSave) return true;
+    return onSave();
+  }, [dirty, isModalPresentation, onSave]);
+
+  const refreshStatus = useCallback(async () => {
+    setStatusLoading(true);
+    try {
+      const [bootstrapData, managedData, progressData, managedLogsData, externalStackData] = await Promise.all([
+        api.getPipelineBootstrapStatus().catch(() => null),
+        api.getManagedRuntimeStatus({ skipCandidates: !shouldFetchManagedCandidates }).catch(() => null),
+        api.getScanProgress().catch(() => null),
+        shouldFetchManagedLogs ? api.getManagedRuntimeLogs({ limit: 18 }).catch(() => null) : Promise.resolve(null),
+        (async () => {
+          if (!shouldCheckExternalLocalStack) return null;
+          let mbOk = false;
+          let ollamaOk = false;
+          const messages: string[] = [];
+          if (musicbrainzBaseUrl) {
+            try {
+              const result = await api.testMusicBrainz(true);
+              mbOk = Boolean(result?.success);
+              if (!mbOk && result?.message) messages.push(result.message);
+            } catch (error) {
+              messages.push(error instanceof Error ? error.message : 'MusicBrainz test failed');
+            }
+          }
+          if (ollamaUrl) {
+            try {
+              await api.getAIModels('ollama', { url: ollamaUrl });
+              ollamaOk = true;
+            } catch (error) {
+              messages.push(error instanceof Error ? error.message : 'Ollama test failed');
+            }
+          }
+          return { musicbrainzOk: mbOk, ollamaOk, message: messages.join(' · ') };
+        })(),
+      ]);
+      if (bootstrapData) setBootstrap(bootstrapData);
+      if (managedData) setManagedStatus(managedData);
+      if (progressData) setScanProgress(progressData);
+      if (managedLogsData?.logs) setManagedRuntimeLogs(managedLogsData.logs);
+      else if (!shouldFetchManagedLogs) setManagedRuntimeLogs([]);
+      if (externalStackData) {
+        setExternalLocalStack({
+          checked: true,
+          musicbrainzOk: externalStackData.musicbrainzOk,
+          ollamaOk: externalStackData.ollamaOk,
+          message: externalStackData.message,
+        });
+      } else if (!shouldCheckExternalLocalStack) {
+        setExternalLocalStack({ checked: false, musicbrainzOk: false, ollamaOk: false, message: '' });
+      }
+    } finally {
+      setStatusLoading(false);
+    }
+  }, [musicbrainzBaseUrl, ollamaUrl, shouldCheckExternalLocalStack, shouldFetchManagedCandidates, shouldFetchManagedLogs]);
+
+  const refreshProviderStatus = useCallback(async (options?: { quiet?: boolean }) => {
+    setProvidersChecking(true);
+    try {
+      // In modal onboarding, keep provider checks draft-local until the wizard
+      // is explicitly committed. Saving the whole config here can trigger
+      // backend validation for later steps and freeze navigation again.
+      if (isModalPresentation && dirty) {
+        setProvidersPreflight(null);
+        return null;
+      }
+      const persisted = await persistIfNeeded();
+      if (!persisted) return null;
+      const next = await api.getProvidersPreflight();
+      setProvidersPreflight(next);
+      return next;
+    } catch (error) {
+      if (!options?.quiet) {
+        toast.error(error instanceof Error ? error.message : 'Failed to check provider credentials');
+      }
+      return null;
+    } finally {
+      setProvidersChecking(false);
+    }
+  }, [dirty, isModalPresentation, persistIfNeeded]);
+
+  useEffect(() => {
+    void refreshStatus();
+    const intervalMs = localStackProvisioningActive ? 3000 : 15000;
+    const timer = window.setInterval(() => {
+      void refreshStatus();
+    }, intervalMs);
+    return () => window.clearInterval(timer);
+  }, [refreshStatus]);
+
+  useEffect(() => {
+    if (!isModalPresentation) return;
+    setActiveStep(0);
+  }, [isModalPresentation]);
+
+  useEffect(() => {
+    if (selectedStackMode !== 'local') return;
+    if (activeStep !== 3 && activeStep !== 8) return;
+    void refreshStatus();
+  }, [activeStep, refreshStatus, selectedStackMode]);
+
+  useEffect(() => {
+    if (!usesLegacyOllamaDefaults) return;
+    updateConfig({
+      OLLAMA_MODEL: DEFAULT_OLLAMA_FAST_MODEL,
+      OLLAMA_COMPLEX_MODEL: DEFAULT_OLLAMA_HARD_MODEL,
+    });
+  }, [updateConfig, usesLegacyOllamaDefaults]);
+
+  useEffect(() => {
+    if (initializedDefaultsRef.current) return;
+    const updates: Partial<PMDAConfig> = {};
+
+    if (config.USE_MUSICBRAINZ === undefined) updates.USE_MUSICBRAINZ = true;
+    if (config.USE_DISCOGS === undefined) updates.USE_DISCOGS = true;
+    if (config.USE_ITUNES === undefined) updates.USE_ITUNES = true;
+    if (config.USE_DEEZER === undefined) updates.USE_DEEZER = true;
+    if (config.USE_SPOTIFY === undefined) updates.USE_SPOTIFY = true;
+    if (config.USE_QOBUZ === undefined) updates.USE_QOBUZ = true;
+    if (config.USE_TIDAL === undefined) updates.USE_TIDAL = true;
+    if (config.USE_LASTFM === undefined) updates.USE_LASTFM = true;
+    if (config.USE_BANDCAMP === undefined) updates.USE_BANDCAMP = true;
+    if (config.USE_ACOUSTID === undefined) updates.USE_ACOUSTID = true;
+    if (config.TRACKLIST_MATCH_MIN === undefined) updates.TRACKLIST_MATCH_MIN = 0.8;
+    if (config.USE_AI_FOR_SOFT_MATCH_PROFILES === undefined) updates.USE_AI_FOR_SOFT_MATCH_PROFILES = true;
+    if (config.LIVE_ALBUMS_MB_STRICT === undefined) updates.LIVE_ALBUMS_MB_STRICT = false;
+    if (config.LIVE_DEDUPE_MODE === undefined) updates.LIVE_DEDUPE_MODE = 'safe';
+    if (config.NORMALIZE_PARENTHETICAL_FOR_DEDUPE === undefined) updates.NORMALIZE_PARENTHETICAL_FOR_DEDUPE = true;
+    if (config.PIPELINE_ENABLE_DEDUPE === undefined) updates.PIPELINE_ENABLE_DEDUPE = true;
+    if (config.AUTO_MOVE_DUPES === undefined) updates.AUTO_MOVE_DUPES = false;
+    if (config.PIPELINE_ENABLE_INCOMPLETE_MOVE === undefined) updates.PIPELINE_ENABLE_INCOMPLETE_MOVE = false;
+    if (config.REPROCESS_INCOMPLETE_ALBUMS === undefined) updates.REPROCESS_INCOMPLETE_ALBUMS = true;
+    if (config.BROKEN_ALBUM_CONSECUTIVE_THRESHOLD === undefined) updates.BROKEN_ALBUM_CONSECUTIVE_THRESHOLD = 2;
+    if (config.BROKEN_ALBUM_PERCENTAGE_THRESHOLD === undefined) updates.BROKEN_ALBUM_PERCENTAGE_THRESHOLD = 0.25;
+    if (config.FILES_TAG_WRITE_MODE === undefined) updates.FILES_TAG_WRITE_MODE = 'pmda_id_only';
+
+    const hasExplicitMetadataChoice = Boolean(
+      config.MUSICBRAINZ_MIRROR_ENABLED !== undefined
+      || String(config.AI_PROVIDER || '').trim()
+      || String(config.WEB_SEARCH_PROVIDER || '').trim()
+      || String(config.OLLAMA_RUNTIME_MODE || '').trim()
+      || String(config.MUSICBRAINZ_RUNTIME_MODE || '').trim(),
+    );
+
+    const forceLocalDefault = !stackChoiceLocked;
+    const shouldRewriteLocalHostUrls = inferredLocalHost !== 'localhost' && inferredLocalHost !== '127.0.0.1';
+
+    if (!hasExplicitMetadataChoice || forceLocalDefault) {
+      Object.assign(updates, {
+        MUSICBRAINZ_MIRROR_ENABLED: true,
+        MUSICBRAINZ_RUNTIME_MODE: 'managed',
+        PROVIDER_GATEWAY_ENABLED: true,
+        PROVIDER_GATEWAY_CACHE_ENABLED: true,
+        AI_PROVIDER: 'ollama',
+        OLLAMA_RUNTIME_MODE: 'managed',
+        MUSICBRAINZ_BASE_URL: (shouldRewriteLocalHostUrls || !rawMusicbrainzBaseUrl) ? inferredLocalMusicbrainzUrl : rawMusicbrainzBaseUrl,
+        OLLAMA_URL: (shouldRewriteLocalHostUrls || !rawOllamaUrl) ? inferredLocalOllamaUrl : rawOllamaUrl,
+        OLLAMA_MODEL: ollamaModel,
+        OLLAMA_COMPLEX_MODEL: ollamaHardModel,
+        SCAN_AI_POLICY: 'local_only',
+        WEB_SEARCH_PROVIDER: 'ollama',
+        AI_USAGE_LEVEL: 'auto',
+        USE_AI_FOR_MB_MATCH: false,
+        USE_AI_FOR_MB_VERIFY: false,
+        USE_AI_FOR_DEDUPE: false,
+        PROVIDER_IDENTITY_USE_AI: false,
+        USE_AI_WEB_SEARCH_FALLBACK: false,
+      });
+    }
+
+    if (shouldRewriteLocalHostUrls) {
+      if (rawMusicbrainzBaseUrl && isLocalhostUrl(rawMusicbrainzBaseUrl)) {
+        updates.MUSICBRAINZ_BASE_URL = inferredLocalMusicbrainzUrl;
+      }
+      if (rawOllamaUrl && isLocalhostUrl(rawOllamaUrl)) {
+        updates.OLLAMA_URL = inferredLocalOllamaUrl;
+      }
+    }
+
+    if (Object.keys(updates).length > 0) {
+      updateConfig(updates);
+    }
+    initializedDefaultsRef.current = true;
+  }, [config.AI_PROVIDER, config.BROKEN_ALBUM_CONSECUTIVE_THRESHOLD, config.BROKEN_ALBUM_PERCENTAGE_THRESHOLD, config.LIVE_ALBUMS_MB_STRICT, config.LIVE_DEDUPE_MODE, config.MUSICBRAINZ_MIRROR_ENABLED, config.MUSICBRAINZ_RUNTIME_MODE, config.NORMALIZE_PARENTHETICAL_FOR_DEDUPE, config.OLLAMA_RUNTIME_MODE, config.OLLAMA_URL, config.REPROCESS_INCOMPLETE_ALBUMS, config.TRACKLIST_MATCH_MIN, config.USE_ACOUSTID, config.USE_AI_FOR_SOFT_MATCH_PROFILES, config.USE_BANDCAMP, config.USE_DEEZER, config.USE_DISCOGS, config.USE_ITUNES, config.USE_LASTFM, config.USE_MUSICBRAINZ, config.USE_QOBUZ, config.USE_SPOTIFY, config.USE_TIDAL, config.WEB_SEARCH_PROVIDER, inferredLocalHost, inferredLocalMusicbrainzUrl, inferredLocalOllamaUrl, ollamaHardModel, ollamaModel, rawMusicbrainzBaseUrl, rawOllamaUrl, stackChoiceLocked, updateConfig]);
+
+  const applyWorkflowPreset = useCallback((mode: WorkflowMode) => {
+    const nextUpdates: Partial<PMDAConfig> = {
+      LIBRARY_MODE: 'files',
+      LIBRARY_WORKFLOW_MODE: mode,
+      PIPELINE_ENABLE_EXPORT: workflowNeedsPublishedLibrary(mode),
+      EXPORT_LINK_STRATEGY: (config.EXPORT_LINK_STRATEGY || 'hardlink') as NonNullable<PMDAConfig['EXPORT_LINK_STRATEGY']>,
+      LIBRARY_MATERIALIZATION_MODE: (config.LIBRARY_MATERIALIZATION_MODE || config.EXPORT_LINK_STRATEGY || 'hardlink') as NonNullable<PMDAConfig['LIBRARY_MATERIALIZATION_MODE']>,
+    };
+    if (mode === 'audit') {
+      Object.assign(nextUpdates, {
+        PIPELINE_ENABLE_DEDUPE: true,
+        AUTO_MOVE_DUPES: false,
+        PIPELINE_ENABLE_INCOMPLETE_MOVE: false,
+        PIPELINE_ENABLE_EXPORT: false,
+        PIPELINE_ENABLE_PLAYER_SYNC: false,
+        PIPELINE_PLAYER_TARGET: 'none',
+        FILES_TAG_WRITE_MODE: 'pmda_id_only',
+      });
+    }
+    updateConfig(nextUpdates);
+  }, [config.EXPORT_LINK_STRATEGY, config.LIBRARY_MATERIALIZATION_MODE, updateConfig]);
+
+  const applyStackPreset = useCallback((mode: StackMode) => {
+    setStackChoiceLocked(true);
+    if (mode === 'local') {
+      updateConfig({
+        MUSICBRAINZ_MIRROR_ENABLED: true,
+        MUSICBRAINZ_RUNTIME_MODE: 'managed',
+        MUSICBRAINZ_BASE_URL: musicbrainzBaseUrl || inferredLocalMusicbrainzUrl,
+        PROVIDER_GATEWAY_ENABLED: true,
+        PROVIDER_GATEWAY_CACHE_ENABLED: true,
+        AI_PROVIDER: 'ollama',
+        OLLAMA_RUNTIME_MODE: 'managed',
+        OLLAMA_URL: ollamaUrl || inferredLocalOllamaUrl,
+        OLLAMA_MODEL: ollamaModel,
+        OLLAMA_COMPLEX_MODEL: ollamaHardModel,
+        SCAN_AI_POLICY: 'local_only',
+        WEB_SEARCH_PROVIDER: 'ollama',
+        AI_USAGE_LEVEL: 'auto',
+        USE_AI_FOR_MB_MATCH: false,
+        USE_AI_FOR_MB_VERIFY: false,
+        USE_AI_FOR_DEDUPE: false,
+        PROVIDER_IDENTITY_USE_AI: false,
+        USE_AI_WEB_SEARCH_FALLBACK: false,
+        USE_ITUNES: config.USE_ITUNES ?? true,
+        USE_DEEZER: config.USE_DEEZER ?? true,
+        USE_SPOTIFY: config.USE_SPOTIFY ?? true,
+        USE_QOBUZ: config.USE_QOBUZ ?? true,
+        USE_TIDAL: config.USE_TIDAL ?? true,
+        USE_BANDCAMP: config.USE_BANDCAMP ?? true,
+      });
+      return;
+    }
+
+    updateConfig({
+      MUSICBRAINZ_MIRROR_ENABLED: false,
+      MUSICBRAINZ_RUNTIME_MODE: 'absent',
+      PROVIDER_GATEWAY_ENABLED: true,
+      PROVIDER_GATEWAY_CACHE_ENABLED: true,
+      AI_PROVIDER: normalizeExternalProvider(config.AI_PROVIDER),
+      OLLAMA_RUNTIME_MODE: 'absent',
+      SCAN_AI_POLICY: 'paid_only',
+      WEB_SEARCH_PROVIDER: 'auto',
+      AI_USAGE_LEVEL: 'auto',
+      USE_AI_FOR_MB_MATCH: false,
+      USE_AI_FOR_MB_VERIFY: false,
+      USE_AI_FOR_DEDUPE: false,
+      PROVIDER_IDENTITY_USE_AI: false,
+      USE_AI_WEB_SEARCH_FALLBACK: false,
+      USE_ITUNES: config.USE_ITUNES ?? true,
+      USE_DEEZER: config.USE_DEEZER ?? true,
+      USE_SPOTIFY: config.USE_SPOTIFY ?? true,
+      USE_QOBUZ: config.USE_QOBUZ ?? true,
+      USE_TIDAL: config.USE_TIDAL ?? true,
+      USE_BANDCAMP: config.USE_BANDCAMP ?? true,
+    });
+  }, [config.AI_PROVIDER, config.USE_BANDCAMP, config.USE_DEEZER, config.USE_ITUNES, config.USE_QOBUZ, config.USE_SPOTIFY, config.USE_TIDAL, ollamaHardModel, ollamaModel, ollamaUrl, updateConfig]);
+
+  const setExternalProvider = useCallback((provider: ExternalAiProvider) => {
+    const updates: Partial<PMDAConfig> = {
+      AI_PROVIDER: provider,
+      MUSICBRAINZ_MIRROR_ENABLED: false,
+      MUSICBRAINZ_RUNTIME_MODE: 'absent',
+      OLLAMA_RUNTIME_MODE: 'absent',
+      SCAN_AI_POLICY: 'paid_only',
+      WEB_SEARCH_PROVIDER: 'auto',
+      AI_USAGE_LEVEL: 'auto',
+      USE_AI_FOR_MB_MATCH: false,
+      USE_AI_FOR_MB_VERIFY: false,
+      USE_AI_FOR_DEDUPE: false,
+      PROVIDER_IDENTITY_USE_AI: false,
+      USE_AI_WEB_SEARCH_FALLBACK: false,
+    };
+    if (provider === 'openai-api') {
+      updates.OPENAI_API_KEY = String(config.OPENAI_API_KEY || '');
+    }
+    updateConfig(updates);
+  }, [config.OPENAI_API_KEY, updateConfig]);
+
+  const localStackActivity = useMemo(() => {
+    if (selectedStackMode !== 'local') return false;
+    return [managedMbBundle, managedOllamaBundle].some((bundle) => {
+      if (!bundle) return false;
+      const state = String(bundle.state || '').trim().toLowerCase();
+      return state !== 'ready' && state !== 'failed' && state !== 'absent' && state !== 'idle';
+    });
+  }, [managedMbBundle, managedOllamaBundle, selectedStackMode]);
+
+  const localStackProvisioningActive = selectedStackMode === 'local' && (runtimeActionBusy || localStackActivity);
+
+  const missingFolderItems = useMemo(() => {
+    const missing: string[] = [];
+
+    if (workflowMode === 'managed' && intakeRoots.length === 0) {
+      missing.push('Add at least one intake folder.');
+    }
+    if ((workflowMode === 'mirror' || workflowMode === 'inplace' || workflowMode === 'audit') && sourceRoots.length === 0) {
+      missing.push(
+        workflowMode === 'mirror'
+          ? 'Add at least one source library folder.'
+          : workflowMode === 'audit'
+            ? 'Add at least one library folder to audit.'
+            : 'Add at least one library folder.',
+      );
+    }
+    if ((workflowMode === 'managed' || workflowMode === 'mirror') && !servingRoot) {
+      missing.push('Choose the clean serving library folder.');
+    }
+    if (!dupesRoot) {
+      missing.push('Choose the duplicates folder.');
+    }
+    if (!incompleteRoot) {
+      missing.push('Choose the incomplete albums folder.');
+    }
+
+    return missing;
+  }, [dupesRoot, incompleteRoot, intakeRoots.length, servingRoot, sourceRoots.length, workflowMode]);
+
+  const foldersReady = missingFolderItems.length === 0;
+  const managedPreflightReady = selectedStackMode === 'online' ? true : Boolean(managedStatus?.preflight.available);
+  const musicbrainzReady = selectedStackMode === 'online'
+    ? true
+    : isBundleReady(managedMbBundle) || externalLocalStack.musicbrainzOk;
+  const ollamaReady = selectedStackMode === 'online'
+    ? true
+    : (isBundleReady(managedOllamaBundle) || externalLocalStack.ollamaOk)
+      && (externalLocalStack.ollamaOk || (availableManagedModels.includes(ollamaModel) && availableManagedModels.includes(ollamaHardModel)));
+  const externalLocalStackReady = selectedStackMode === 'local'
+    && externalLocalStack.checked
+    && externalLocalStack.musicbrainzOk
+    && externalLocalStack.ollamaOk;
+  const localServicesReady = selectedStackMode === 'local' && musicbrainzReady && ollamaReady;
+  const localRuntimeReady = selectedStackMode === 'online'
+    ? true
+    : externalLocalStackReady || localServicesReady;
+
+  useEffect(() => {
+    return;
+  }, [activeStep, localRuntimeReady, localStackConfirmOpen, localStackProvisioningActive, managedPreflightReady, selectedStackMode, statusLoading]);
+
+  useEffect(() => {
+    setProvidersPreflight(null);
+  }, [
+    config.MUSICBRAINZ_EMAIL,
+    config.USE_MUSICBRAINZ,
+    config.DISCOGS_USER_TOKEN,
+    config.USE_DISCOGS,
+    config.USE_ITUNES,
+    config.USE_DEEZER,
+    config.USE_SPOTIFY,
+    config.USE_QOBUZ,
+    config.USE_TIDAL,
+    config.LASTFM_API_KEY,
+    config.LASTFM_API_SECRET,
+    config.USE_LASTFM,
+    config.ACOUSTID_API_KEY,
+    config.USE_ACOUSTID,
+    config.USE_BANDCAMP,
+  ]);
+
+  useEffect(() => {
+    if (activeStep !== 4) return;
+    const timer = window.setTimeout(() => {
+      void refreshProviderStatus({ quiet: true });
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [
+    activeStep,
+    refreshProviderStatus,
+    config.MUSICBRAINZ_EMAIL,
+    config.USE_MUSICBRAINZ,
+    config.DISCOGS_USER_TOKEN,
+    config.USE_DISCOGS,
+    config.USE_ITUNES,
+    config.USE_DEEZER,
+    config.USE_SPOTIFY,
+    config.USE_QOBUZ,
+    config.USE_TIDAL,
+    config.LASTFM_API_KEY,
+    config.LASTFM_API_SECRET,
+    config.USE_LASTFM,
+    config.ACOUSTID_API_KEY,
+    config.USE_ACOUSTID,
+    config.USE_BANDCAMP,
+  ]);
+
+  useEffect(() => {
+    if (selectedStackMode !== 'online') {
+      setExternalValidationState('idle');
+      setExternalValidationMessage('');
+      setExternalModels([]);
+      return;
+    }
+
+    const provider = selectedExternalProvider;
+    const credential = providerCredential(config, provider);
+    if (!credential) {
+      setExternalValidationState('idle');
+      setExternalValidationMessage('Add an API key to validate the provider and fetch compatible models.');
+      setExternalModels([]);
+      return;
+    }
+
+    const requestId = providerValidationRequestRef.current + 1;
+    providerValidationRequestRef.current = requestId;
+    setExternalValidationState('loading');
+    setExternalValidationMessage('Checking provider credentials and loading models…');
+
+    const timer = window.setTimeout(async () => {
+      try {
+        const models = await api.getAIModels(provider, { apiKey: credential });
+        if (providerValidationRequestRef.current !== requestId) return;
+        setExternalModels(models);
+        setExternalValidationState('valid');
+        setExternalValidationMessage(models.length > 0 ? 'Provider validated. Choose the model PMDA should use during the scan.' : 'Provider validated, but no compatible model was returned.');
+        if (models.length > 0 && !models.includes(String(config.OPENAI_MODEL || '').trim())) {
+          updateConfig({ OPENAI_MODEL: models[0] });
+        }
+      } catch (error) {
+        if (providerValidationRequestRef.current !== requestId) return;
+        setExternalModels([]);
+        setExternalValidationState('error');
+        setExternalValidationMessage(error instanceof Error ? error.message : 'Failed to validate this provider');
+      }
+    }, 450);
+
+    return () => window.clearTimeout(timer);
+  }, [config, selectedExternalProvider, selectedStackMode, updateConfig]);
+
+  const providerState = useCallback((
+    key: 'discogs' | 'lastfm' | 'acoustid',
+    configuredValue: boolean,
+    enabled: boolean,
+  ): ProviderStatus => {
+    if (!enabled) {
+      return {
+        variant: 'outline',
+        label: 'Off',
+        message: 'Disabled for this first scan.',
+      };
+    }
+    if (!configuredValue) {
+      return {
+        variant: 'outline',
+        label: 'Needs credentials',
+        message: 'Add the required credentials or switch this source off.',
+      };
+    }
+    if (!providersPreflight) {
+      return {
+        variant: 'secondary',
+        label: 'Configured',
+        message: 'Ready to verify on the next provider check.',
+      };
+    }
+    const result = providersPreflight[key];
+    if (!result) {
+      return {
+        variant: 'secondary',
+        label: 'Configured',
+        message: 'No check result available yet.',
+      };
+    }
+    if (result.ok) {
+      return {
+        variant: 'default',
+        label: 'Valid',
+        message: result.message || 'Credentials look good.',
+      };
+    }
+    return {
+      variant: 'destructive',
+      label: 'Issue',
+      message: result.message || 'Credential check failed.',
+    };
+  }, [providersPreflight]);
+
+  const optionalProviderState = useCallback((
+    key: 'fanart' | 'serper' | 'audiodb',
+    configuredValue: boolean,
+    idleMessage: string,
+  ): ProviderStatus => {
+    if (!configuredValue) {
+      return {
+        variant: 'outline',
+        label: 'Optional',
+        message: idleMessage,
+      };
+    }
+    if (!providersPreflight) {
+      return {
+        variant: 'secondary',
+        label: 'Configured',
+        message: 'Ready to verify on the next provider check.',
+      };
+    }
+    const result = providersPreflight[key];
+    if (!result) {
+      return {
+        variant: 'secondary',
+        label: 'Configured',
+        message: 'No check result available yet.',
+      };
+    }
+    if (result.ok) {
+      return {
+        variant: 'default',
+        label: 'Valid',
+        message: result.message || 'Credential check passed.',
+      };
+    }
+    return {
+      variant: 'destructive',
+      label: 'Issue',
+      message: result.message || 'Credential check failed.',
+    };
+  }, [providersPreflight]);
+
+  const musicbrainzEnabled = config.USE_MUSICBRAINZ !== false;
+  const discogsEnabled = config.USE_DISCOGS !== false;
+  const itunesEnabled = config.USE_ITUNES !== false;
+  const deezerEnabled = config.USE_DEEZER !== false;
+  const spotifyEnabled = config.USE_SPOTIFY !== false;
+  const qobuzEnabled = config.USE_QOBUZ !== false;
+  const tidalEnabled = config.USE_TIDAL !== false;
+  const lastfmEnabled = config.USE_LASTFM !== false;
+  const bandcampEnabled = config.USE_BANDCAMP !== false;
+  const acoustidEnabled = config.USE_ACOUSTID !== false;
+  const webSearchEnabled = Boolean(config.USE_WEB_SEARCH_FOR_MB ?? true);
+
+  const musicbrainzConfigured = Boolean(String(config.MUSICBRAINZ_EMAIL || '').trim());
+  const discogsConfigured = Boolean(String(config.DISCOGS_USER_TOKEN || '').trim());
+  const lastfmConfigured = Boolean(String(config.LASTFM_API_KEY || '').trim() && String(config.LASTFM_API_SECRET || '').trim());
+  const acoustidConfigured = Boolean(String(config.ACOUSTID_API_KEY || '').trim());
+  const fanartConfigured = Boolean(String(config.FANART_API_KEY || '').trim());
+  const audiodbConfigured = Boolean(String(config.THEAUDIODB_API_KEY || '').trim());
+  const serperConfigured = Boolean(String(config.SERPER_API_KEY || '').trim());
+
+  const musicbrainzStatus: ProviderStatus = useMemo(() => {
+    if (!musicbrainzEnabled) {
+      return {
+        variant: 'outline',
+        label: 'Off',
+        message: 'Disabled for the metadata pipeline.',
+      };
+    }
+    if (!musicbrainzConfigured) {
+      return {
+        variant: 'outline',
+        label: 'Needs email',
+        message: 'Add a MusicBrainz contact email before the first scan.',
+      };
+    }
+    const result = providersPreflight?.musicbrainz;
+    if (!result) {
+      return {
+        variant: 'secondary',
+        label: 'Configured',
+        message: selectedStackMode === 'local'
+          ? 'MusicBrainz will use the managed local mirror when it becomes ready.'
+          : 'Ready to verify on the next provider check.',
+      };
+    }
+    if (result.ok) {
+      return {
+        variant: 'default',
+        label: 'Valid',
+        message: result.message || 'MusicBrainz identity is ready.',
+      };
+    }
+    return {
+      variant: 'destructive',
+      label: 'Issue',
+      message: result.message || 'MusicBrainz check failed.',
+    };
+  }, [musicbrainzConfigured, musicbrainzEnabled, providersPreflight, selectedStackMode]);
+
+  const discogsStatus = providerState('discogs', discogsConfigured, discogsEnabled);
+  const itunesStatus: ProviderStatus = itunesEnabled
+    ? {
+      variant: 'secondary',
+      label: 'Enabled',
+      message: 'No key required. Adds Apple catalog cross-checks and extra cover fallbacks.',
+    }
+    : {
+      variant: 'outline',
+      label: 'Off',
+      message: 'iTunes / Apple Music fallback is disabled for this scan.',
+    };
+  const deezerStatus: ProviderStatus = deezerEnabled
+    ? {
+      variant: 'secondary',
+      label: 'Enabled',
+      message: 'No key required. Adds Deezer cross-checks, genres and extra cover fallbacks.',
+    }
+    : {
+      variant: 'outline',
+      label: 'Off',
+      message: 'Deezer fallback is disabled for this scan.',
+    };
+  const spotifyStatus: ProviderStatus = spotifyEnabled
+    ? {
+      variant: 'secondary',
+      label: 'Enabled',
+      message: 'No key required. Adds Spotify page metadata and extra cover evidence.',
+    }
+    : {
+      variant: 'outline',
+      label: 'Off',
+      message: 'Spotify metadata fallback is disabled for this scan.',
+    };
+  const qobuzStatus: ProviderStatus = qobuzEnabled
+    ? {
+      variant: 'secondary',
+      label: 'Enabled',
+      message: 'No key required. Adds Qobuz store metadata and artwork fallbacks.',
+    }
+    : {
+      variant: 'outline',
+      label: 'Off',
+      message: 'Qobuz metadata fallback is disabled for this scan.',
+    };
+  const tidalStatus: ProviderStatus = tidalEnabled
+    ? {
+      variant: 'secondary',
+      label: 'Enabled',
+      message: 'No key required. Adds TIDAL page metadata as a low-priority fallback.',
+    }
+    : {
+      variant: 'outline',
+      label: 'Off',
+      message: 'TIDAL metadata fallback is disabled for this scan.',
+    };
+  const lastfmStatus = providerState('lastfm', lastfmConfigured, lastfmEnabled);
+  const acoustidStatus = providerState('acoustid', acoustidConfigured, acoustidEnabled);
+  const fanartStatus = optionalProviderState(
+    'fanart',
+    fanartConfigured,
+    'Optional. Add a key only if you want extra artist artwork fallback from Fanart.tv.',
+  );
+  const audiodbStatus = optionalProviderState(
+    'audiodb',
+    audiodbConfigured,
+    'Optional. Add a key only if you want TheAudioDB as an extra album and artist artwork fallback.',
+  );
+  const serperStatus: ProviderStatus = !webSearchEnabled
+    ? {
+      variant: 'outline',
+      label: 'Off',
+      message: 'Web search fallback is disabled for this first scan.',
+    }
+    : optionalProviderState(
+      'serper',
+      serperConfigured,
+      'Optional. PMDA can still use local or AI-native web search paths, but Serper gives a dedicated external web-search backend.',
+    );
+  const bandcampStatus: ProviderStatus = bandcampEnabled
+    ? {
+      variant: 'secondary',
+      label: 'Enabled',
+      message: 'No key required. Used as a last-resort fallback provider.',
+    }
+    : {
+      variant: 'outline',
+      label: 'Off',
+      message: 'Bandcamp fallback is disabled for this scan.',
+    };
+
+  const sourceIssues = useMemo(() => {
+    const issues: string[] = [];
+    if (musicbrainzEnabled && !musicbrainzConfigured) issues.push('Add a MusicBrainz contact email or switch MusicBrainz off.');
+    if (discogsEnabled && !discogsConfigured) issues.push('Add a Discogs user token or switch Discogs off.');
+    if (lastfmEnabled && !lastfmConfigured) issues.push('Add Last.fm API key + secret or switch Last.fm off.');
+    if (acoustidEnabled && !acoustidConfigured) issues.push('Add an AcoustID API key or switch AcoustID off.');
+
+    if (musicbrainzEnabled && musicbrainzConfigured && providersPreflight?.musicbrainz && !providersPreflight.musicbrainz.ok) {
+      issues.push(providersPreflight.musicbrainz.message || 'Fix the MusicBrainz identity check.');
+    }
+    if (discogsEnabled && discogsConfigured && providersPreflight?.discogs && !providersPreflight.discogs.ok) {
+      issues.push(providersPreflight.discogs.message || 'Fix the Discogs credentials.');
+    }
+    if (lastfmEnabled && lastfmConfigured && providersPreflight?.lastfm && !providersPreflight.lastfm.ok) {
+      issues.push(providersPreflight.lastfm.message || 'Fix the Last.fm credentials.');
+    }
+    if (acoustidEnabled && acoustidConfigured && providersPreflight?.acoustid && !providersPreflight.acoustid.ok) {
+      issues.push(providersPreflight.acoustid.message || 'Fix the AcoustID credentials.');
+    }
+
+    return issues;
+  }, [acoustidConfigured, acoustidEnabled, discogsConfigured, discogsEnabled, lastfmConfigured, lastfmEnabled, musicbrainzConfigured, musicbrainzEnabled, providersPreflight]);
+
+  const sourcesConfigured = sourceIssues.length === 0;
+  const externalModel = String(config.OPENAI_MODEL || '').trim();
+  const externalAiReady = selectedStackMode === 'online'
+    && externalValidationState === 'valid'
+    && externalModels.length > 0
+    && externalModels.includes(externalModel);
+
+  const runtimeSetupReady = selectedStackMode === 'local'
+    ? localRuntimeReady
+    : externalAiReady;
+  const localStackDetectedCount = (managedMbCandidate || externalLocalStack.musicbrainzOk ? 1 : 0)
+    + (managedOllamaCandidate || externalLocalStack.ollamaOk ? 1 : 0);
+  const localStackActionLabel = localStackDetectedCount > 0
+    ? (localStackDetectedCount === 2 ? 'Use detected local services' : 'Use detected service and create the rest')
+    : 'Create local stack';
+  const localStackActionDescription = localRuntimeReady
+    ? 'PMDA detected a ready local MusicBrainz mirror and Ollama runtime. It will use them directly without provisioning new containers.'
+    : localStackDetectedCount === 2
+      ? 'PMDA found an existing MusicBrainz mirror and an existing Ollama runtime on this server. It can adopt them directly after your confirmation.'
+      : localStackDetectedCount === 1
+        ? 'PMDA found one existing local service on this server. It can adopt it and create only the missing part after your confirmation.'
+        : 'No local metadata service was detected yet. PMDA will create the MusicBrainz mirror and the Ollama runtime after your confirmation.';
+  const localStackNeedsConfirmation = selectedStackMode === 'local'
+    && !localRuntimeReady
+    && managedPreflightReady
+    && !localStackProvisioningActive;
+
+  const localStackChecklist = useMemo(() => {
+    if (selectedStackMode !== 'local') return [];
+    const musicbrainzIdleMessage = externalLocalStack.musicbrainzOk
+      ? `Local MusicBrainz mirror reachable at ${musicbrainzBaseUrl || 'the configured URL'}. PMDA will use it without provisioning.`
+      : managedMbCandidate
+        ? `Existing MusicBrainz mirror detected${managedMbCandidate?.published_url ? ` at ${managedMbCandidate.published_url}` : ''}. It will be adopted when you confirm local setup.`
+        : 'Not started yet. PMDA will provision MusicBrainz after you confirm local setup.';
+    const ollamaIdleMessage = externalLocalStack.ollamaOk
+      ? `Local Ollama runtime reachable at ${ollamaUrl}. PMDA will use it and keep ${ollamaModel} / ${ollamaHardModel} available.`
+      : managedOllamaCandidate
+        ? `Existing Ollama runtime detected${managedOllamaCandidate?.url ? ` at ${managedOllamaCandidate.url}` : ''}. It will be adopted when you confirm local setup and PMDA will ensure ${ollamaModel} and ${ollamaHardModel}.`
+        : `Not started yet. PMDA will provision Ollama and install ${ollamaModel} and ${ollamaHardModel} after you confirm local setup.`;
+    const musicbrainzState = effectiveBundleState(managedMbBundle);
+    const ollamaState = effectiveBundleState(managedOllamaBundle);
+    const musicbrainzNotStarted = String(managedMbBundle?.mode || 'absent').trim().toLowerCase() === 'absent' || musicbrainzState === 'idle';
+    const ollamaNotStarted = String(managedOllamaBundle?.mode || 'absent').trim().toLowerCase() === 'absent' || ollamaState === 'idle';
+    const musicbrainzDetail = musicbrainzReady
+      ? 'Local MusicBrainz mirror is ready.'
+      : musicbrainzNotStarted
+        ? musicbrainzIdleMessage
+        : effectiveBundleMessage(managedMbBundle, musicbrainzIdleMessage);
+    const ollamaDetail = ollamaReady
+      ? `Ollama is ready with ${ollamaModel} and ${ollamaHardModel}.`
+      : ollamaNotStarted
+        ? ollamaIdleMessage
+        : effectiveBundleMessage(managedOllamaBundle, ollamaIdleMessage);
+
+    return [
+      {
+        key: 'musicbrainz',
+        label: 'MusicBrainz mirror',
+        done: musicbrainzReady,
+        detail: musicbrainzDetail,
+        progress: musicbrainzNotStarted ? 0 : managedBundleProgress(managedMbBundle),
+        displayProgress: musicbrainzNotStarted ? 0 : managedBundleDisplayProgress(managedMbBundle),
+        eta: musicbrainzNotStarted || musicbrainzState === 'failed' ? '' : managedBundleEta(managedMbBundle),
+        phase: effectiveBundlePhase(managedMbBundle),
+      },
+      {
+        key: 'ollama',
+        label: 'Ollama + required models',
+        done: ollamaReady,
+        detail: ollamaDetail,
+        progress: ollamaNotStarted ? 0 : managedBundleProgress(managedOllamaBundle, { requiredModels: [ollamaModel, ollamaHardModel] }),
+        displayProgress: ollamaNotStarted ? 0 : managedBundleDisplayProgress(managedOllamaBundle, { requiredModels: [ollamaModel, ollamaHardModel] }),
+        eta: ollamaNotStarted || ollamaState === 'failed' ? '' : managedBundleEta(managedOllamaBundle),
+        phase: effectiveBundlePhase(managedOllamaBundle),
+      },
+    ];
+  }, [externalLocalStack.musicbrainzOk, externalLocalStack.ollamaOk, managedMbBundle, managedMbCandidate, managedOllamaBundle, managedOllamaCandidate, musicbrainzBaseUrl, musicbrainzReady, ollamaHardModel, ollamaModel, ollamaReady, ollamaUrl, selectedStackMode]);
+
+  const localStackProgress = useMemo(() => {
+    if (selectedStackMode !== 'local' || localStackChecklist.length === 0) return 0;
+    const total = localStackChecklist.reduce((sum, item) => sum + item.progress, 0);
+    return Math.round(total / localStackChecklist.length);
+  }, [localStackChecklist, selectedStackMode]);
+
+  const musicbrainzDisplayProgress = useMemo(
+    () => managedBundleDisplayProgress(managedMbBundle),
+    [managedMbBundle],
+  );
+
+  const musicbrainzDisplayEta = useMemo(
+    () => managedBundleEta(managedMbBundle),
+    [managedMbBundle],
+  );
+
+  const showMusicbrainzDownloadProgress = selectedStackMode === 'local'
+    && effectiveBundlePhase(managedMbBundle) === 'importing'
+    && !musicbrainzReady
+    && musicbrainzDisplayProgress > 0;
+
+  const localStackServices = useMemo(() => {
+    if (selectedStackMode !== 'local' || !showRuntimeDetails) return [];
+    const musicbrainzServices = (managedMbBundle?.services || []).map((service) => ({
+      bundleLabel: 'MusicBrainz mirror',
+      name: service.name,
+      status: service.status,
+      message: service.message,
+    }));
+    const ollamaServices = (managedOllamaBundle?.services || []).map((service) => ({
+      bundleLabel: 'Ollama',
+      name: service.name,
+      status: service.status,
+      message: service.message,
+    }));
+    return [...musicbrainzServices, ...ollamaServices];
+  }, [managedMbBundle?.services, managedOllamaBundle?.services, selectedStackMode, showRuntimeDetails]);
+
+  const localStackRecentLogs = useMemo(() => {
+    if (selectedStackMode !== 'local' || !showRuntimeDetails) return [];
+    return managedRuntimeLogs
+      .filter((entry) => entry.bundle_type === 'musicbrainz_local' || entry.bundle_type === 'ollama_local')
+      .slice(0, 6);
+  }, [managedRuntimeLogs, selectedStackMode, showRuntimeDetails]);
+
+  const firstScanStarted = Boolean(
+    scanProgress && (
+      scanProgress.scanning
+      || scanProgress.scan_starting
+      || scanProgress.resume_available
+      || scanProgress.scan_resume_run_id
+      || scanProgress.scan_start_time != null
+      || (scanProgress.artists_total ?? 0) > 0
+      || (scanProgress.detected_albums_total ?? 0) > 0
+      || (scanProgress.scan_run_scope_total ?? 0) > 0
+      || scanProgress.last_scan_summary
+    ),
+  );
+
+  const playerSyncReady = useMemo(() => {
+    if (playerTarget === 'none') return true;
+    if (playerTarget === 'plex') {
+      return Boolean(String(config.PLEX_HOST || '').trim() && (String(config.PLEX_TOKEN || '').trim() || Boolean(config.PLEX_TOKEN_SET)));
+    }
+    if (playerTarget === 'jellyfin') {
+      return Boolean(String(config.JELLYFIN_URL || '').trim() && String(config.JELLYFIN_API_KEY || '').trim());
+    }
+    return Boolean(
+      String(config.NAVIDROME_URL || '').trim()
+      && (
+        String(config.NAVIDROME_API_KEY || '').trim()
+        || (
+          String(config.NAVIDROME_USERNAME || '').trim()
+          && String(config.NAVIDROME_PASSWORD || '').trim()
+        )
+      ),
+    );
+  }, [config.JELLYFIN_API_KEY, config.JELLYFIN_URL, config.NAVIDROME_API_KEY, config.NAVIDROME_PASSWORD, config.NAVIDROME_URL, config.NAVIDROME_USERNAME, config.PLEX_HOST, config.PLEX_TOKEN, config.PLEX_TOKEN_SET, playerTarget]);
+
+  const sourcesStepReady = sourcesConfigured;
+  const rulesReady = Boolean(matchPolicy && dedupeFormatStrategy && dedupeSensitivity && incompleteMode);
+  const schedulerPaused = config.SCHEDULER_PAUSED !== false;
+  const allowNonScanJobs = Boolean(config.SCHEDULER_ALLOW_NON_SCAN_JOBS ?? false);
+  const postScanAsync = Boolean(config.PIPELINE_POST_SCAN_ASYNC ?? false);
+  const scanFirstModeEnabled = schedulerPaused && !allowNonScanJobs && !postScanAsync;
+  const scanBehaviorReady = true;
+
+  const pipelineConfigReady = useMemo(() => {
+    if (wantsPublishedLibrary && publishLibraryEnabled && !materializationMode) return false;
+    if (!playerSyncReady) return false;
+    return true;
+  }, [materializationMode, playerSyncReady, publishLibraryEnabled, wantsPublishedLibrary]);
+
+  const launchReady = foldersReady && runtimeSetupReady && sourcesStepReady && rulesReady && pipelineConfigReady && scanBehaviorReady && pipelineStepConfirmed;
+
+  const reviewFingerprint = JSON.stringify({
+    workflowMode,
+    selectedStackMode,
+    selectedExternalProvider,
+    externalModel,
+    sourcesConfigured,
+    matchPolicy,
+    musicbrainzEnabled,
+    discogsEnabled,
+    lastfmEnabled,
+    bandcampEnabled,
+    acoustidEnabled,
+    publishLibraryEnabled,
+    materializationMode,
+    dedupeMode,
+    dedupeFormatStrategy,
+    dedupeSensitivity,
+    incompleteMode,
+    tagWriteMode,
+    reprocessIncompleteAlbums: Boolean(config.REPROCESS_INCOMPLETE_ALBUMS),
+    brokenAlbumConsecutiveThreshold: Number(config.BROKEN_ALBUM_CONSECUTIVE_THRESHOLD ?? 0),
+    brokenAlbumPercentageThreshold: Number(config.BROKEN_ALBUM_PERCENTAGE_THRESHOLD ?? 0),
+    normalizeParenthetical: Boolean(config.NORMALIZE_PARENTHETICAL_FOR_DEDUPE),
+    schedulerPaused,
+    allowNonScanJobs,
+    postScanAsync,
+    playerTarget,
+    playerSyncReady,
+    localRuntimeReady,
+    externalAiReady,
+  });
+
+  useEffect(() => {
+    if (!reviewFingerprintRef.current) {
+      reviewFingerprintRef.current = reviewFingerprint;
+      return;
+    }
+    if (reviewFingerprintRef.current !== reviewFingerprint) {
+      reviewFingerprintRef.current = reviewFingerprint;
+      setPipelineStepConfirmed(false);
+    }
+  }, [reviewFingerprint]);
+
+  const blockers = useMemo(() => {
+    const next: Blocker[] = [];
+
+    if (!foldersReady) {
+      next.push({
+        key: 'folders',
+        title: 'Required folders are missing',
+        detail: missingFolderItems[0] || 'Choose the mandatory folders for this workflow.',
+        sectionId: 'settings-files-export',
+        stepId: 'folders',
+      });
+    }
+
+    if (!sourcesConfigured) {
+      next.push({
+        key: 'sources',
+        title: 'Metadata sources still need configuration',
+        detail: sourceIssues[0] || 'Add the missing provider credentials or switch the source off.',
+        sectionId: 'settings-providers-advanced',
+        stepId: 'sources',
+      });
+    }
+
+    if (selectedStackMode === 'local' && !localRuntimeReady) {
+      next.push({
+        key: 'local-runtime',
+        title: localStackProvisioningActive ? 'Local metadata stack is still preparing' : 'Local metadata stack is not ready yet',
+        detail: !managedPreflightReady
+          ? (managedStatus?.preflight.message || 'Docker socket or runtime tooling is not ready.')
+          : localStackNeedsConfirmation
+            ? 'PMDA is waiting for your confirmation to create or adopt the local MusicBrainz + Ollama services.'
+            : !musicbrainzReady
+              ? (managedMbBundle?.phase_message || 'Managed MusicBrainz is not ready yet.')
+              : (managedOllamaBundle?.phase_message || 'Managed Ollama or the required models are not ready yet.'),
+        sectionId: 'settings-scaling',
+        stepId: 'runtime',
+      });
+    }
+
+    if (selectedStackMode === 'online' && !runtimeSetupReady) {
+      next.push({
+        key: 'external-ai',
+        title: 'External AI provider is not ready',
+        detail: externalValidationMessage || 'Validate the external provider and choose a compatible model.',
+        sectionId: 'settings-ai',
+        stepId: 'runtime',
+      });
+    }
+
+    if (!pipelineConfigReady) {
+      next.push({
+        key: 'pipeline',
+        title: 'Pipeline choices are incomplete',
+        detail: !playerSyncReady
+          ? 'Complete the selected player sync credentials or switch player sync off.'
+          : 'Finish the required pipeline choices before launching the first scan.',
+        sectionId: 'settings-outputs',
+        stepId: 'pipeline',
+      });
+    }
+
+    if (!pipelineStepConfirmed) {
+      next.push({
+        key: 'pipeline-review',
+        title: 'Rules, pipeline and scan behavior still need a final review',
+        detail: 'Open the rules, pipeline and scan behavior steps, then confirm the final launch review.',
+        stepId: 'scan_behavior',
+      });
+    }
+
+    return next;
+  }, [externalValidationMessage, foldersReady, localStackNeedsConfirmation, localStackProvisioningActive, managedMbBundle?.phase_message, managedOllamaBundle?.phase_message, managedPreflightReady, managedStatus?.preflight.message, missingFolderItems, musicbrainzReady, pipelineConfigReady, pipelineStepConfirmed, playerSyncReady, runtimeSetupReady, selectedStackMode, sourceIssues, sourcesConfigured]);
+
+  const completionCount = useMemo(() => {
+    let count = 0;
+    if (workflowMode) count += 1;
+    if (foldersReady) count += 1;
+    if (selectedStackMode === 'local' || selectedStackMode === 'online') count += 1;
+    if (runtimeSetupReady) count += 1;
+    if (sourcesStepReady) count += 1;
+    if (rulesReady) count += 1;
+    if (pipelineConfigReady) count += 1;
+    if (scanBehaviorReady) count += 1;
+    if (launchReady) count += 1;
+    return count;
+  }, [foldersReady, launchReady, pipelineConfigReady, rulesReady, runtimeSetupReady, scanBehaviorReady, selectedStackMode, sourcesStepReady, workflowMode]);
+
+  const wizardPercent = Math.round(((activeStep + 1) / STEP_ORDER.length) * 100);
+
+  const scanProgressPercent = Number.isFinite(Number(scanProgress?.stage_progress_percent))
+    ? Number(scanProgress?.stage_progress_percent)
+    : Number.isFinite(Number(scanProgress?.overall_progress_percent))
+      ? Number(scanProgress?.overall_progress_percent)
+      : Number.isFinite(Number(scanProgress?.progress)) && Number(scanProgress?.total)
+        ? (Number(scanProgress?.progress) / Math.max(1, Number(scanProgress?.total))) * 100
+        : 0;
+
+  const metadataLabel = selectedStackMode === 'local' ? 'Local stack' : 'External AI';
+  const readinessLabel = launchReady ? 'Ready to scan' : blockers[0]?.title || 'Setup still needs attention';
+  const firstScanLabel = scanProgress?.scanning
+    ? 'Scan running'
+    : scanProgress?.resume_available
+      ? 'Resume available'
+      : firstScanStarted || !Boolean(bootstrap?.bootstrap_required)
+        ? 'Already started'
+        : 'Not started';
+
+  const goToStep = useCallback(async (nextStep: number) => {
+    const bounded = Math.max(0, Math.min(STEP_ORDER.length - 1, nextStep));
+    if (bounded > activeStep) {
+      // Guided onboarding runs as a draft-first modal. Persisting on every
+      // forward step makes the backend validate fields that belong to later
+      // steps (folders, runtime, sources, pipeline), which blocks navigation on
+      // a fresh install. Keep the whole draft local until the user explicitly
+      // starts a runtime action or launches the first scan.
+      if (!isModalPresentation) {
+        const persisted = await persistIfNeeded();
+        if (!persisted) return;
+      }
+    }
+    setActiveStep(bounded);
+    requestAnimationFrame(() => {
+      const container = document.querySelector<HTMLElement>('[data-guided-onboarding-scroll="true"]');
+      if (container) container.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+  }, [activeStep, isModalPresentation, persistIfNeeded]);
+
+  const bootstrapLocalStack = useCallback(async (): Promise<boolean> => {
+    setRuntimeActionBusy(true);
+    try {
+      const persisted = await persistIfNeeded();
+      if (!persisted) return false;
+
+      updateConfig({
+        MANAGED_RUNTIME_CONFIG_ROOT: resolvedManagedConfigRoot,
+        MANAGED_RUNTIME_DATA_ROOT: resolvedManagedDataRoot,
+        MUSICBRAINZ_MIRROR_NAME: String(config.MUSICBRAINZ_MIRROR_NAME || 'Managed local MusicBrainz').trim() || 'Managed local MusicBrainz',
+      });
+
+      const result = await api.bootstrapManagedRuntime({
+        config_root: resolvedManagedConfigRoot,
+        data_root: resolvedManagedDataRoot,
+        bundles: {
+          musicbrainz_local: {
+            action: 'auto',
+            mirror_name: String(config.MUSICBRAINZ_MIRROR_NAME || 'Managed local MusicBrainz').trim() || 'Managed local MusicBrainz',
+          },
+          ollama_local: {
+            action: 'auto',
+            fast_model: ollamaModel,
+            hard_model: ollamaHardModel,
+          },
+        },
+      });
+      setManagedStatus(result.snapshot);
+      toast.success('Local metadata stack creation started');
+      void refreshStatus();
+      return true;
+    } catch (error) {
+      const fallbackStatus = await api.getManagedRuntimeStatus({ skipCandidates: true }).catch(() => null);
+      if (fallbackStatus) {
+        setManagedStatus(fallbackStatus);
+        const musicbrainzState = String(fallbackStatus.bundles?.musicbrainz_local?.state || '').trim().toLowerCase();
+        const ollamaState = String(fallbackStatus.bundles?.ollama_local?.state || '').trim().toLowerCase();
+        if (
+          ['preflight', 'creating', 'pulling', 'starting', 'waiting_health'].includes(musicbrainzState)
+          || ['preflight', 'creating', 'pulling', 'starting', 'waiting_health', 'ready'].includes(ollamaState)
+        ) {
+          toast('Local stack bootstrap is running in the background. Staying on the wizard and following live progress.');
+          return true;
+        }
+      }
+      toast.error(error instanceof Error ? error.message : 'Failed to create the local metadata stack');
+      return false;
+    } finally {
+      setRuntimeActionBusy(false);
+    }
+  }, [config.MUSICBRAINZ_MIRROR_NAME, ollamaHardModel, ollamaModel, persistIfNeeded, refreshStatus, resolvedManagedConfigRoot, resolvedManagedDataRoot, updateConfig]);
+
+  const confirmAndStartLocalStack = useCallback(async () => {
+    const started = await bootstrapLocalStack();
+    if (!started) return;
+    setLocalStackConfirmOpen(false);
+    await goToStep(3);
+  }, [bootstrapLocalStack, goToStep]);
+
+  const handleNextStep = useCallback(async () => {
+    if (activeStep >= STEP_ORDER.length - 1) return;
+
+    if (activeStep === 2 && selectedStackMode === 'local') {
+      await goToStep(activeStep + 1);
+      return;
+    }
+
+    if (activeStep === 3 && !runtimeSetupReady) {
+      toast.error(blockers.find((blocker) => blocker.stepId === 'runtime')?.detail || 'Finish the runtime or external AI setup first.');
+      return;
+    }
+
+    if (activeStep === 4 && !sourcesStepReady) {
+      toast.error(blockers.find((blocker) => blocker.stepId === 'sources')?.detail || 'Finish the metadata source configuration first.');
+      return;
+    }
+
+    if (activeStep === 5) {
+      if (!rulesReady) {
+        toast.error('Finish the matching, duplicate and incomplete rules first.');
+        return;
+      }
+    }
+
+    if (activeStep === 6) {
+      if (!pipelineConfigReady) {
+        toast.error(blockers.find((blocker) => blocker.stepId === 'pipeline')?.detail || 'Finish the pipeline choices first.');
+        return;
+      }
+    }
+
+    if (activeStep === 7) {
+      setPipelineStepConfirmed(true);
+    }
+
+    await goToStep(activeStep + 1);
+  }, [activeStep, blockers, goToStep, localStackNeedsConfirmation, pipelineConfigReady, rulesReady, runtimeSetupReady, selectedStackMode, sourcesStepReady]);
+
+  const startOrResumeScan = useCallback(async () => {
+    setScanActionBusy(true);
+    try {
+      const persisted = await persistIfNeeded();
+      if (!persisted) return;
+
+      if (scanProgress?.scanning || (firstScanStarted && !Boolean(bootstrap?.bootstrap_required) && !scanProgress?.resume_available)) {
+        navigate('/scan');
+      } else if (scanProgress?.resume_available && !scanProgress?.scanning) {
+        await api.resumeScan();
+        toast.success('Scan resumed');
+        navigate('/scan');
+      } else {
+        await api.startScan({ scan_type: 'full', run_improve_after: true });
+        toast.success('First full scan started');
+        navigate('/scan');
+      }
+
+      if (isModalPresentation && onClose) onClose();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Failed to start scan');
+    } finally {
+      setScanActionBusy(false);
+    }
+  }, [bootstrap?.bootstrap_required, firstScanStarted, isModalPresentation, navigate, onClose, persistIfNeeded, scanProgress?.resume_available, scanProgress?.scanning]);
+
+  const openAdvancedSection = useCallback((sectionId: string) => {
+    if (isModalPresentation && onClose) onClose();
+    if (window.location.pathname === '/settings') {
+      requestAnimationFrame(() => {
+        scrollToSection(sectionId);
+        window.history.replaceState(null, '', `#${sectionId}`);
+      });
+      return;
+    }
+    navigate(`/settings#${sectionId}`);
+  }, [isModalPresentation, navigate, onClose]);
+
+  const setDedupeMode = useCallback((mode: DedupeMode) => {
+    if (mode === 'ignore') {
+      updateConfig({ PIPELINE_ENABLE_DEDUPE: false, AUTO_MOVE_DUPES: false });
+      return;
+    }
+    if (mode === 'detect') {
+      updateConfig({ PIPELINE_ENABLE_DEDUPE: true, AUTO_MOVE_DUPES: false });
+      return;
+    }
+    updateConfig({ PIPELINE_ENABLE_DEDUPE: true, AUTO_MOVE_DUPES: true });
+  }, [updateConfig]);
+
+  const setMatchPolicy = useCallback((policy: MatchPolicy) => {
+    if (policy === 'perfect') {
+      updateConfig({
+        TRACKLIST_MATCH_MIN: 0.98,
+        USE_AI_FOR_SOFT_MATCH_PROFILES: false,
+      });
+      return;
+    }
+    updateConfig({
+      TRACKLIST_MATCH_MIN: 0.8,
+      USE_AI_FOR_SOFT_MATCH_PROFILES: true,
+    });
+  }, [updateConfig]);
+
+  const setDedupeFormatStrategy = useCallback((strategy: DedupeFormatStrategy) => {
+    if (strategy === 'compact') {
+      updateConfig({ FORMAT_PREFERENCE: FORMAT_PRESET_COMPACT });
+      return;
+    }
+    if (strategy === 'balanced') {
+      updateConfig({ FORMAT_PREFERENCE: FORMAT_PRESET_BALANCED });
+      return;
+    }
+    updateConfig({ FORMAT_PREFERENCE: FORMAT_PRESET_QUALITY });
+  }, [updateConfig]);
+
+  const setDedupeSensitivity = useCallback((sensitivity: DedupeSensitivity) => {
+    updateConfig({ LIVE_DEDUPE_MODE: sensitivity });
+  }, [updateConfig]);
+
+  const setIncompleteHandling = useCallback((mode: IncompleteMode) => {
+    if (mode === 'keep') {
+      updateConfig({ PIPELINE_ENABLE_INCOMPLETE_MOVE: false });
+      return;
+    }
+    if (mode === 'strict') {
+      updateConfig({
+        PIPELINE_ENABLE_INCOMPLETE_MOVE: true,
+        BROKEN_ALBUM_CONSECUTIVE_THRESHOLD: 1,
+        BROKEN_ALBUM_PERCENTAGE_THRESHOLD: 0.1,
+      });
+      return;
+    }
+    updateConfig({
+      PIPELINE_ENABLE_INCOMPLETE_MOVE: true,
+      BROKEN_ALBUM_CONSECUTIVE_THRESHOLD: 2,
+      BROKEN_ALBUM_PERCENTAGE_THRESHOLD: 0.25,
+    });
+  }, [updateConfig]);
+
+  const setPlayerTarget = useCallback((target: NonNullable<PMDAConfig['PIPELINE_PLAYER_TARGET']>) => {
+    updateConfig({
+      PIPELINE_PLAYER_TARGET: target,
+      PIPELINE_ENABLE_PLAYER_SYNC: target !== 'none',
+    });
+  }, [updateConfig]);
+
+  const sourceSummary = [
+    musicbrainzEnabled ? 'MusicBrainz' : null,
+    discogsEnabled ? 'Discogs' : null,
+    itunesEnabled ? 'iTunes / Apple Music' : null,
+    deezerEnabled ? 'Deezer' : null,
+    spotifyEnabled ? 'Spotify' : null,
+    qobuzEnabled ? 'Qobuz' : null,
+    tidalEnabled ? 'TIDAL' : null,
+    lastfmEnabled ? 'Last.fm' : null,
+    bandcampEnabled ? 'Bandcamp' : null,
+    acoustidEnabled ? 'AcoustID' : null,
+  ].filter(Boolean).join(', ');
+
+  const reviewRows = [
+    {
+      label: 'Workflow',
+      value: workflowMeta.label,
+      detail: workflowMeta.whenToUse,
+      step: 0,
+    },
+    {
+      label: 'Metadata',
+      value: selectedStackMode === 'local' ? 'Local stack' : EXTERNAL_AI_OPTIONS.find((option) => option.value === selectedExternalProvider)?.label || 'External AI',
+      detail: selectedStackMode === 'local'
+        ? (localRuntimeReady ? 'MusicBrainz mirror + Ollama ready.' : 'Local stack still needs to finish.')
+        : (externalValidationState === 'valid' ? `${selectedExternalProvider} validated with ${externalModel}.` : externalValidationMessage || 'Provider still needs validation.'),
+      step: 3,
+    },
+    {
+      label: 'Sources',
+      value: sourceSummary || 'No source enabled',
+      detail: sourcesConfigured ? 'All enabled sources are configured.' : sourceIssues[0] || 'A source still needs configuration.',
+      step: 4,
+    },
+    {
+      label: 'Match policy',
+      value: matchPolicy === 'soft' ? 'Soft matches accepted' : 'Perfect matches only',
+      detail: matchPolicy === 'soft'
+        ? 'More near-matches survive and can still be enriched by providers.'
+        : 'PMDA stays conservative and leaves more releases unmatched.',
+      step: 5,
+    },
+    {
+      label: 'Duplicate rules',
+      value: dedupeMode === 'ignore' ? 'Ignore' : dedupeMode === 'detect' ? 'Detect only' : 'Detect and move',
+      detail: `${dedupeFormatStrategy === 'quality' ? 'Prefer best audio quality' : dedupeFormatStrategy === 'compact' ? 'Prefer smaller files' : 'Prefer balanced winners'} · ${dedupeSensitivity === 'aggressive' ? 'broader grouping' : 'safer grouping'}`,
+      step: 5,
+    },
+    {
+      label: 'Incomplete rules',
+      value: incompleteMode === 'keep' ? 'Keep everything in place' : incompleteMode === 'strict' ? 'Move even small gaps' : 'Move only obvious gaps',
+      detail: Boolean(config.REPROCESS_INCOMPLETE_ALBUMS) ? 'Incomplete releases stay eligible for repair in future runs.' : 'Incomplete releases are not auto-retried later.',
+      step: 5,
+    },
+    {
+      label: 'Write mode',
+      value: tagWriteLabel,
+      detail: auditMode
+        ? (tagWriteMode === 'pmda_id_only'
+          ? 'Audit stays read-only. PMDA keeps metadata in its database and only writes a PMDA ID tag if you later export from the DB.'
+          : 'Audit stays read-only. Full file writes are deferred until you leave audit mode or explicitly export from the PMDA database later.')
+        : (tagWriteMode === 'pmda_id_only'
+          ? 'PMDA keeps metadata in its database and only writes a PMDA ID tag to files.'
+          : 'PMDA writes enriched tags and artwork into your audio files.'),
+      step: 6,
+    },
+    {
+      label: 'Publish library',
+      value: auditMode ? 'Off · audit mode' : wantsPublishedLibrary ? (publishLibraryEnabled ? `On · ${materializationMode}` : 'Off') : 'Not needed',
+      detail: auditMode
+        ? 'Audit mode keeps the current library read-only and does not materialize a second published tree automatically.'
+        : wantsPublishedLibrary
+          ? `Serving root: ${servingRoot || 'not set yet'}`
+          : 'PMDA works directly inside the current library.',
+      step: 6,
+    },
+    {
+      label: 'Player sync',
+      value: auditMode ? 'Unavailable in audit' : playerTarget === 'none' ? 'Not now' : PLAYER_TARGET_OPTIONS.find((option) => option.value === playerTarget)?.label || playerTarget,
+      detail: auditMode
+        ? 'Audit mode leaves external players untouched until you switch workflow or run explicit admin actions.'
+        : playerTarget === 'none'
+          ? 'No external player refresh after the first scan.'
+          : (playerSyncReady ? 'Credentials are present.' : 'Credentials still need to be completed.'),
+      step: 6,
+    },
+    {
+      label: 'Scan behavior',
+      value: scanFirstModeEnabled ? 'Scan-first mode' : 'Flexible background activity',
+      detail: `Scheduled scans: ${schedulerPaused ? 'paused' : 'enabled'} · Non-scan jobs: ${allowNonScanJobs ? 'allowed' : 'disabled'} · Post-scan chain: ${postScanAsync ? 'async queue' : 'inline with scan'}`,
+      step: 7,
+    },
+  ];
+
+  if (!isModalPresentation) {
+    return (
+      <Card id="settings-onboarding" className="scroll-mt-24 border-primary/25 bg-primary/[0.04]">
+        <CardHeader>
+          <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+            <div className="space-y-1.5">
+              <CardTitle className="flex items-center gap-2">
+                <span className="inline-flex h-8 w-8 items-center justify-center rounded-md bg-primary/20 text-primary">
+                  <Sparkles className="h-4 w-4" />
+                </span>
+                Guided setup
+              </CardTitle>
+              <CardDescription>
+                Use the short setup flow to lock workflow, folders, metadata, rules, pipeline behavior, scan behavior and the first scan review in one place.
+              </CardDescription>
+            </div>
+            <Button type="button" className="gap-2 self-start" onClick={onOpenGuidedSetup}>
+              <Sparkles className="h-4 w-4" />
+              Open guided setup
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-3 md:grid-cols-4">
+            <div className="rounded-2xl border border-border/70 bg-background/60 p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Workflow</div>
+              <div className="mt-2 text-sm font-semibold text-foreground">{workflowMeta.label}</div>
+              <p className="mt-1 text-xs text-muted-foreground">{workflowMeta.description}</p>
+            </div>
+            <div className="rounded-2xl border border-border/70 bg-background/60 p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Metadata</div>
+              <div className="mt-2 text-sm font-semibold text-foreground">{metadataLabel}</div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {selectedStackMode === 'local' ? 'Local-first path, no recurring paid AI by default.' : 'External AI provider selected for metadata escalation.'}
+              </p>
+            </div>
+            <div className="rounded-2xl border border-border/70 bg-background/60 p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Readiness</div>
+              <div className="mt-2 flex items-center gap-2 text-sm font-semibold text-foreground">
+                {statusLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : launchReady ? <CheckCircle2 className="h-4 w-4 text-emerald-500" /> : <AlertTriangle className="h-4 w-4 text-amber-500" />}
+                {readinessLabel}
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">{blockers[0]?.detail || 'No blocking issue detected.'}</p>
+            </div>
+            <div className="rounded-2xl border border-border/70 bg-background/60 p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">First scan</div>
+              <div className="mt-2 text-sm font-semibold text-foreground">{firstScanLabel}</div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {scanProgress?.scanning ? `Current phase: ${scanProgress.phase || 'running'}` : configured ? 'PMDA already has a configured library state.' : 'Use the guided setup to reach a first valid scan.'}
+              </p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <div className="space-y-5">
+      <div className="rounded-[28px] border border-white/10 bg-[linear-gradient(160deg,rgba(15,23,42,0.98),rgba(9,14,31,0.96))] p-5 text-white shadow-[0_24px_80px_rgba(2,6,23,0.42)] md:p-6">
+        <div className="flex flex-col gap-5">
+          <div className="space-y-2">
+            <div className="inline-flex items-center gap-2 rounded-full border border-primary/25 bg-primary/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-primary/90">
+              Guided setup
+            </div>
+            <h2 className="text-2xl font-semibold tracking-tight">Set the essentials, then launch the first scan.</h2>
+            <p className="max-w-2xl text-sm text-slate-300">
+              Nine short steps: choose the workflow, point PMDA at the right folders, pick local or external metadata, finish the runtime or AI setup, configure the required sources, define the matching and quarantine rules, decide the pipeline behavior, set scan behavior, then review exactly what the first scan will do.
+            </p>
+          </div>
+          <div className="space-y-3">
+            <div className="flex items-center justify-between text-xs text-slate-400">
+              <span>{STEP_ORDER[activeStep]?.label}</span>
+              <span>{launchReady ? 'Ready to scan' : `${completionCount}/${STEP_ORDER.length} steps ready`}</span>
+            </div>
+            <Progress value={wizardPercent} className="h-2 bg-white/10" />
+            <div className="grid gap-2 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-9">
+              {STEP_ORDER.map((step, index) => {
+                const complete = (
+                  (step.id === 'workflow' && Boolean(workflowMode))
+                  || (step.id === 'folders' && foldersReady)
+                  || (step.id === 'metadata' && Boolean(selectedStackMode))
+                  || (step.id === 'runtime' && runtimeSetupReady)
+                  || (step.id === 'sources' && sourcesStepReady)
+                  || (step.id === 'rules' && rulesReady)
+                  || (step.id === 'pipeline' && pipelineConfigReady)
+                  || (step.id === 'scan_behavior' && scanBehaviorReady)
+                  || (step.id === 'review' && launchReady)
+                );
+                const active = index === activeStep;
+                return (
+                  <div
+                    key={step.id}
+                    className={`rounded-2xl border px-3 py-3 ${active ? 'border-primary/45 bg-primary/12' : complete ? 'border-emerald-500/25 bg-emerald-500/10' : 'border-white/10 bg-white/[0.03]'}`}
+                  >
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">{step.label}</div>
+                    <div className="mt-1 text-sm font-semibold text-white">{step.title}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <Card className="border-white/10 bg-slate-950/72 text-white shadow-[0_24px_80px_rgba(2,6,23,0.34)]">
+        <CardContent data-guided-onboarding-scroll="true" className="space-y-6 p-5 md:p-6">
+          {activeStep === 0 ? (
+            <div className="space-y-5">
+            <div className="space-y-1">
+              <div className="text-sm font-semibold text-white">How should PMDA work with your music folders?</div>
+                <p className="text-sm text-slate-400">Pick the situation that matches your current setup. Recommended for most users: keep an intake folder for new arrivals and let PMDA build a separate clean library.</p>
+              </div>
+              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                {WORKFLOW_OPTIONS.map((option) => {
+                  const selected = workflowMode === option.value;
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => applyWorkflowPreset(option.value)}
+                      className={`rounded-3xl border p-4 text-left transition ${selected ? 'border-primary/50 bg-primary/12 shadow-[0_0_0_1px_rgba(59,130,246,0.18)]' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        {option.value === 'managed' ? (
+                          <Badge variant="outline" className="border-emerald-500/35 bg-emerald-500/10 text-emerald-200">
+                            Recommended
+                          </Badge>
+                        ) : null}
+                        <Badge variant="outline" className="border-white/15 bg-white/5 text-slate-200">{option.modeName}</Badge>
+                        {selected ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                      </div>
+                      <div className="mt-4">
+                        <div className="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-white/5 text-primary">
+                          <Workflow className="h-5 w-5" />
+                        </div>
+                      </div>
+                      <div className="mt-4 text-lg font-semibold text-white">{option.label}</div>
+                      <p className="mt-2 text-sm leading-6 text-slate-300">{option.description}</p>
+                      <p className="mt-3 text-xs leading-5 text-slate-400">{option.whenToUse}</p>
+                      <p className="mt-3 text-xs font-medium text-slate-200">{option.asksFor}</p>
+                      <div className="mt-4">
+                        <WorkflowDiagram nodes={option.diagram} />
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+
+          {activeStep === 1 ? (
+            <div className="space-y-5">
+              <div className="space-y-1">
+                <div className="text-sm font-semibold text-white">Set the required folders</div>
+                <p className="text-sm text-slate-400">Only existing folders are shown here. Music folders stay inside <span className="font-mono text-slate-200">/music</span> so the wizard cannot invent the wrong path.</p>
+              </div>
+
+              <div className="grid gap-4 lg:grid-cols-2">
+                {workflowMode === 'managed' ? (
+                  <PathListEditor
+                    label="Intake folders"
+                    description="New albums arrive here before PMDA validates and publishes them."
+                    paths={intakeRoots}
+                    onChange={(paths) => updateConfig({ LIBRARY_INTAKE_ROOTS: stringifyPathList(paths), FILES_ROOTS: stringifyPathList(paths) })}
+                    placeholder="/music/incomming"
+                    selectLabel="Select intake folder"
+                    browseRoot="/music"
+                    lockToBrowseRoot
+                  />
+                ) : null}
+
+                {(workflowMode === 'mirror' || workflowMode === 'inplace' || workflowMode === 'audit') ? (
+                  <PathListEditor
+                    label={
+                      workflowMode === 'mirror'
+                        ? 'Source library folders'
+                        : workflowMode === 'audit'
+                          ? 'Library folders to audit'
+                          : 'Library folders'
+                    }
+                    description={
+                      workflowMode === 'mirror'
+                        ? 'PMDA reads these folders and builds a clean serving copy elsewhere.'
+                        : workflowMode === 'audit'
+                          ? 'PMDA reads these folders, builds the PMDA library view, and keeps files untouched unless an admin later applies a manual action.'
+                          : 'PMDA validates and serves directly from these folders.'
+                    }
+                    paths={sourceRoots}
+                    onChange={(paths) => updateConfig({ LIBRARY_SOURCE_ROOTS: stringifyPathList(paths), FILES_ROOTS: stringifyPathList(paths) })}
+                    placeholder={workflowMode === 'mirror' ? '/music/Music_dump' : '/music/Music_matched'}
+                    selectLabel={
+                      workflowMode === 'mirror'
+                        ? 'Select source library folder'
+                        : workflowMode === 'audit'
+                          ? 'Select library folder to audit'
+                          : 'Select library folder'
+                    }
+                    browseRoot="/music"
+                    lockToBrowseRoot
+                  />
+                ) : null}
+
+                {(workflowMode === 'managed' || workflowMode === 'mirror') ? (
+                  <SingleFolderField
+                    label="Serving library"
+                    description="This is the clean library PMDA will expose to Jellyfin or Navidrome if you enable player sync."
+                    value={servingRoot}
+                    onChange={(value) => updateConfig({ LIBRARY_SERVING_ROOT: normalizeFolderPath(value), EXPORT_ROOT: normalizeFolderPath(value) })}
+                    placeholder="/music/Music_matched"
+                    selectLabel="Select serving library folder"
+                    browseRoot="/music"
+                    lockToBrowseRoot
+                  />
+                ) : null}
+
+                <SingleFolderField
+                  label="Duplicates"
+                  description="Duplicate losers go here for later review."
+                  value={dupesRoot}
+                  onChange={(value) => updateConfig({ LIBRARY_DUPES_ROOT: normalizeFolderPath(value), DUPE_ROOT: normalizeFolderPath(value) })}
+                  placeholder="/dupes"
+                  selectLabel="Select duplicates folder"
+                />
+
+                <SingleFolderField
+                  label="Incomplete albums"
+                  description="Albums flagged as incomplete are quarantined here."
+                  value={incompleteRoot}
+                  onChange={(value) => updateConfig({ LIBRARY_INCOMPLETE_ROOT: normalizeFolderPath(value), INCOMPLETE_ALBUMS_TARGET_DIR: normalizeFolderPath(value) })}
+                  placeholder="/dupes/incomplete_albums"
+                  selectLabel="Select incomplete albums folder"
+                />
+              </div>
+
+              {missingFolderItems.length > 0 ? (
+                <div className="rounded-2xl border border-amber-500/25 bg-amber-500/10 p-4 text-sm text-amber-100">
+                  <div className="flex items-center gap-2 font-medium">
+                    <AlertTriangle className="h-4 w-4" />
+                    Still missing
+                  </div>
+                  <ul className="mt-2 space-y-1 text-xs text-amber-50/90">
+                    {missingFolderItems.map((item) => (
+                      <li key={item}>• {item}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : (
+                <div className="rounded-2xl border border-emerald-500/25 bg-emerald-500/10 p-4 text-sm text-emerald-100">
+                  <div className="flex items-center gap-2 font-medium">
+                    <CheckCircle2 className="h-4 w-4" />
+                    Required folders are set
+                  </div>
+                </div>
+              )}
+              {auditMode ? (
+                <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-100">
+                  <div className="font-medium">Audit workflow stays read-only</div>
+                  <p className="mt-2 text-xs leading-5 text-amber-50/90">
+                    PMDA will still index the library, surface dupes and incompletes, and enrich the PostgreSQL view, but it will not move files, publish a clean tree, or refresh players automatically in this workflow.
+                  </p>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {activeStep === 2 ? (
+            <div className="space-y-5">
+              <div className="space-y-1">
+                <div className="text-sm font-semibold text-white">Choose the metadata mode</div>
+                <p className="text-sm text-slate-400">The local stack is the default path. It avoids recurring paid AI costs and keeps metadata work stable on your server.</p>
+              </div>
+              <div className="grid gap-3 md:grid-cols-2">
+                <button
+                  type="button"
+                  onClick={() => applyStackPreset('local')}
+                  className={`rounded-3xl border p-5 text-left transition ${selectedStackMode === 'local' ? 'border-primary/50 bg-primary/12 shadow-[0_0_0_1px_rgba(59,130,246,0.18)]' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="outline" className="border-emerald-500/35 bg-emerald-500/10 text-emerald-200">Recommended</Badge>
+                    {selectedStackMode === 'local' ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                  </div>
+                  <div className="mt-4">
+                    <div className="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-white/5 text-primary">
+                      <Server className="h-5 w-5" />
+                    </div>
+                  </div>
+                  <div className="mt-4 text-lg font-semibold text-white">Local stack</div>
+                  <p className="mt-2 text-sm leading-6 text-slate-300">
+                    Uses a local MusicBrainz mirror and a local Ollama runtime on this server. Best when you want stable throughput and no recurring API bill for the core setup.
+                  </p>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => applyStackPreset('online')}
+                  className={`rounded-3xl border p-5 text-left transition ${selectedStackMode === 'online' ? 'border-primary/50 bg-primary/12 shadow-[0_0_0_1px_rgba(59,130,246,0.18)]' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    {selectedStackMode === 'online' ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                  </div>
+                  <div className="mt-4">
+                    <div className="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-white/5 text-primary">
+                      <Globe className="h-5 w-5" />
+                    </div>
+                  </div>
+                  <div className="mt-4 text-lg font-semibold text-white">External AI</div>
+                  <p className="mt-2 text-sm leading-6 text-slate-300">
+                    Uses public metadata services and a paid external AI provider. Faster to bootstrap if you already have API keys, but more expensive over time.
+                  </p>
+                </button>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4 text-sm text-slate-300">
+                {selectedStackMode === 'local'
+                  ? (localRuntimeReady
+                    ? 'A reachable local stack is already ready. The next step only verifies the runtime details before you continue.'
+                    : localStackNeedsConfirmation
+                      ? 'Local-first is active. The next step will let you confirm local runtime adoption or creation only if something is still missing.'
+                      : 'Local-first is active. The next step verifies the runtime status and shows live progress if PMDA still needs to provision anything.')
+                  : 'External AI is active. Next, configure the provider, validate the key, then choose the model PMDA should use.'}
+              </div>
+            </div>
+          ) : null}
+
+          {activeStep === 3 || activeStep === 4 ? (
+            <div className="space-y-5">
+              <div className="space-y-1">
+                <div className="text-sm font-semibold text-white">
+                  {activeStep === 3 ? 'Finish the runtime or external AI setup' : 'Configure the metadata sources'}
+                </div>
+                <p className="text-sm text-slate-400">
+                  {activeStep === 3
+                    ? 'This step is only about the local runtime or the external AI provider. Metadata sources come in the next step.'
+                    : 'Keep only the providers you really want in the first scan. If a source stays on, configure it here and use the provider links below to create any missing keys.'}
+                </p>
+              </div>
+
+              {activeStep === 3 && (selectedStackMode === 'local' ? (
+                <div className="space-y-4 rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+                  <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                    <div className="space-y-1">
+                      <div className="text-sm font-semibold text-white">Local stack on this server</div>
+                      <p className="text-xs text-slate-400">
+                        PMDA will use <span className="font-mono text-slate-200">{resolvedManagedConfigRoot}</span> for runtime config and <span className="font-mono text-slate-200">{resolvedManagedDataRoot}</span> for runtime data.
+                      </p>
+                      <p className="text-xs text-slate-400">{localStackActionDescription}</p>
+                      <div className="flex flex-wrap items-center gap-2 pt-1">
+                        <Badge variant={localRuntimeReady ? 'default' : localStackProvisioningActive ? 'secondary' : managedPreflightReady ? 'outline' : 'destructive'}>
+                          {localRuntimeReady ? 'Local stack ready' : localStackProvisioningActive ? 'Provisioning in progress' : managedPreflightReady ? 'Waiting for confirmation' : 'Docker not ready'}
+                        </Badge>
+                        {managedPreflightReady ? (
+                          <Badge variant="outline">Docker reachable</Badge>
+                        ) : localRuntimeReady ? (
+                          <Badge variant="outline">Using existing stack</Badge>
+                        ) : (
+                          <Badge variant="destructive">Docker not ready</Badge>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {!localRuntimeReady && localStackNeedsConfirmation ? (
+                        <Button type="button" size="sm" onClick={() => setLocalStackConfirmOpen(true)} disabled={runtimeActionBusy}>
+                          {runtimeActionBusy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                          Confirm local setup
+                        </Button>
+                      ) : null}
+                      <Button type="button" variant="outline" size="sm" onClick={() => void refreshStatus()} disabled={statusLoading}>
+                        {statusLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                        Refresh status
+                      </Button>
+                      <Button type="button" variant="outline" size="sm" onClick={() => setShowRuntimeDetails((current) => !current)}>
+                        {showRuntimeDetails ? 'Hide runtime details' : 'View runtime details'}
+                        <ChevronDown className={`ml-2 h-4 w-4 transition ${showRuntimeDetails ? 'rotate-180' : ''}`} />
+                      </Button>
+                      <Button type="button" variant="outline" size="sm" onClick={() => openAdvancedSection('settings-scaling')}>
+                        Open advanced settings
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between text-xs text-slate-400">
+                      <span>
+                        {localRuntimeReady
+                          ? 'All local services are ready'
+                          : showMusicbrainzDownloadProgress
+                            ? 'MusicBrainz dump download'
+                            : localStackProvisioningActive
+                              ? 'Local stack creation progress'
+                              : managedPreflightReady
+                                ? 'Waiting for local setup confirmation'
+                                : 'Docker is not ready yet'}
+                      </span>
+                      <span>{localRuntimeReady ? '100%' : `${showMusicbrainzDownloadProgress ? musicbrainzDisplayProgress : localStackProgress}%`}</span>
+                    </div>
+                    <Progress
+                      value={Math.max(0, Math.min(100, showMusicbrainzDownloadProgress ? musicbrainzDisplayProgress : localStackProgress))}
+                      className="h-2 bg-white/10"
+                    />
+                    {!localRuntimeReady && showMusicbrainzDownloadProgress && musicbrainzDisplayEta ? (
+                      <div className="text-[11px] uppercase tracking-[0.14em] text-primary/80">ETA {musicbrainzDisplayEta}</div>
+                    ) : null}
+                  </div>
+
+                  <div className="grid gap-3 md:grid-cols-2">
+                    {localStackChecklist.map((item) => {
+                      const itemDisplayProgress = Math.max(0, Math.min(100, Math.round(Number(item.displayProgress ?? item.progress) || 0)));
+                      return (
+                        <div key={item.key} className="rounded-2xl border border-white/10 bg-black/10 p-4">
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="text-sm font-semibold text-white">{item.label}</div>
+                            <Badge variant={item.done ? 'default' : itemDisplayProgress > 0 ? 'secondary' : 'outline'}>
+                              {item.done ? 'Ready' : itemDisplayProgress > 0 ? `${itemDisplayProgress}%` : item.phase || 'Idle'}
+                            </Badge>
+                          </div>
+                          <p className="mt-2 text-xs leading-5 text-slate-400">{item.detail}</p>
+                          {!item.done && itemDisplayProgress > 0 ? (
+                            <Progress value={itemDisplayProgress} className="mt-3 h-1.5 bg-white/10" />
+                          ) : null}
+                          {!item.done && item.eta ? (
+                            <div className="mt-2 text-[11px] uppercase tracking-[0.14em] text-primary/80">ETA {item.eta}</div>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {showRuntimeDetails ? (
+                    <div className="space-y-3 rounded-2xl border border-white/10 bg-black/10 p-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-semibold text-white">Runtime details</div>
+                          <p className="mt-1 text-xs text-slate-400">Scaling & orchestration stays hidden by default. Use this only when you need to inspect the local setup state.</p>
+                        </div>
+                        <Badge variant="outline" className="border-white/15 bg-white/5 text-slate-200">
+                          {managedPreflightReady ? 'Docker ready' : 'Docker unavailable'}
+                        </Badge>
+                      </div>
+                      <p className="text-xs text-slate-400">{managedStatus?.preflight.message || 'Docker socket and runtime tooling are being checked.'}</p>
+                      {localStackServices.length > 0 ? (
+                        <div className="grid gap-2 md:grid-cols-2">
+                          {localStackServices.map((service) => (
+                            <div key={`${service.bundleLabel}-${service.name}`} className="rounded-2xl border border-white/10 bg-white/[0.02] px-3 py-3">
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="text-sm font-medium text-white">{service.name}</div>
+                                <Badge variant="outline" className="border-white/15 bg-white/5 text-slate-200">
+                                  {service.status}
+                                </Badge>
+                              </div>
+                              <div className="mt-1 text-[11px] font-medium uppercase tracking-[0.14em] text-slate-500">{service.bundleLabel}</div>
+                              <p className="mt-2 text-xs leading-5 text-slate-400">{service.message || 'Detected on this server.'}</p>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                      {localStackRecentLogs.length > 0 ? (
+                        <div className="space-y-2">
+                          {localStackRecentLogs.map((entry) => (
+                            <div key={entry.log_id} className="rounded-2xl border border-white/10 bg-white/[0.02] px-3 py-2.5">
+                              <div className="flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-[0.14em] text-slate-500">
+                                <span>{managedBundleLabel(entry.bundle_type)}</span>
+                                {entry.service_name ? <span>• {entry.service_name}</span> : null}
+                                {formatRuntimeLogTime(entry.created_at) ? <span>• {formatRuntimeLogTime(entry.created_at)}</span> : null}
+                              </div>
+                              <p className="mt-1 text-xs leading-5 text-slate-300">{compactManagedLogMessage(entry.message)}</p>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="space-y-4 rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+                  <div className="space-y-1">
+                    <div className="text-sm font-semibold text-white">External AI provider</div>
+                    <p className="text-xs text-slate-400">Pick the paid provider, add the API key, then wait for PMDA to validate it and fetch the compatible models automatically.</p>
+                  </div>
+                  <div className="grid gap-3 md:grid-cols-3">
+                    {EXTERNAL_AI_OPTIONS.map((option) => {
+                      const active = selectedExternalProvider === option.value;
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          onClick={() => setExternalProvider(option.value)}
+                          className={`rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="text-sm font-semibold text-white">{option.label}</div>
+                            {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                          </div>
+                          <p className="mt-2 text-xs leading-5 text-slate-400">{option.description}</p>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="grid gap-4 lg:grid-cols-2">
+                    <div className="space-y-2 rounded-2xl border border-white/10 bg-black/10 p-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <Label className="text-sm text-white">API key</Label>
+                        <a
+                          href={EXTERNAL_AI_OPTIONS.find((option) => option.value === selectedExternalProvider)?.docsUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                        >
+                          {EXTERNAL_AI_OPTIONS.find((option) => option.value === selectedExternalProvider)?.docsLabel || 'Create API key'}
+                          <ExternalLink className="h-3 w-3" />
+                        </a>
+                      </div>
+                      <PasswordInput
+                        value={selectedExternalProvider === 'openai-api' ? String(config.OPENAI_API_KEY || '') : selectedExternalProvider === 'anthropic' ? String(config.ANTHROPIC_API_KEY || '') : String(config.GOOGLE_API_KEY || '')}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          if (selectedExternalProvider === 'openai-api') updateConfig({ OPENAI_API_KEY: value, AI_PROVIDER: 'openai-api' });
+                          if (selectedExternalProvider === 'anthropic') updateConfig({ ANTHROPIC_API_KEY: value, AI_PROVIDER: 'anthropic' });
+                          if (selectedExternalProvider === 'google') updateConfig({ GOOGLE_API_KEY: value, AI_PROVIDER: 'google' });
+                        }}
+                        placeholder={selectedExternalProvider === 'openai-api' ? 'sk-...' : 'Enter your API key'}
+                      />
+                      <p className="text-[11px] text-slate-500">The key is validated automatically. PMDA loads compatible models as soon as the provider responds correctly.</p>
+                    </div>
+                    <div className="space-y-2 rounded-2xl border border-white/10 bg-black/10 p-4">
+                      <Label className="text-sm text-white">Validation</Label>
+                      <div className="flex items-center gap-2">
+                        <Badge variant={externalValidationState === 'valid' ? 'default' : externalValidationState === 'error' ? 'destructive' : externalValidationState === 'loading' ? 'secondary' : 'outline'}>
+                          {externalValidationState === 'valid' ? 'Valid' : externalValidationState === 'error' ? 'Issue' : externalValidationState === 'loading' ? 'Checking' : 'Waiting for key'}
+                        </Badge>
+                      </div>
+                      <p className="text-xs leading-5 text-slate-400">{externalValidationMessage || 'Add a valid API key to continue.'}</p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2 rounded-2xl border border-white/10 bg-black/10 p-4">
+                    <Label className="text-sm text-white">Model</Label>
+                    <Select
+                      value={externalModel}
+                      onValueChange={(value) => updateConfig({ OPENAI_MODEL: value, AI_PROVIDER: selectedExternalProvider })}
+                      disabled={externalValidationState !== 'valid' || externalModels.length === 0}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder={externalValidationState === 'valid' ? 'Choose a model' : 'Validate the provider first'} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {externalModels.map((model) => (
+                          <SelectItem key={model} value={model}>{model}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-slate-400">PMDA only enables the next step after the provider is valid and one compatible model has been selected.</p>
+                  </div>
+                </div>
+              ))}
+
+              {activeStep === 4 ? (
+              <div className="space-y-4 rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+                <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                  <div>
+                    <div className="text-sm font-semibold text-white">Metadata sources</div>
+                    <p className="mt-1 text-xs text-slate-400">These are the source providers PMDA will use during the first scan. If a source is on, configure it here or turn it off explicitly.</p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant={sourcesConfigured ? 'default' : 'outline'}>{sourcesConfigured ? 'Sources ready' : 'Sources need attention'}</Badge>
+                    <Button type="button" variant="outline" size="sm" onClick={() => void refreshProviderStatus()} disabled={providersChecking}>
+                      {providersChecking ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                      Check source keys
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 lg:grid-cols-2">
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">MusicBrainz</div>
+                        <p className="text-xs text-slate-400">Required base source. Uses the local mirror when local mode is selected.</p>
+                      </div>
+                      <Switch checked={musicbrainzEnabled} onCheckedChange={(checked) => updateConfig({ USE_MUSICBRAINZ: checked })} />
+                    </div>
+                    <Badge variant={musicbrainzStatus.variant}>{musicbrainzStatus.label}</Badge>
+                    <p className="text-xs leading-5 text-slate-400">{musicbrainzStatus.message}</p>
+                    {musicbrainzEnabled ? (
+                      <div className="space-y-2">
+                        <Label className="text-xs text-slate-200">Contact email</Label>
+                        <Input value={String(config.MUSICBRAINZ_EMAIL || '')} onChange={(event) => updateConfig({ MUSICBRAINZ_EMAIL: event.target.value })} placeholder="name@example.com" />
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">Discogs</div>
+                        <p className="text-xs text-slate-400">Useful for release variants, labels and covers when MusicBrainz is not enough.</p>
+                      </div>
+                      <Switch checked={discogsEnabled} onCheckedChange={(checked) => updateConfig({ USE_DISCOGS: checked })} />
+                    </div>
+                    <Badge variant={discogsStatus.variant}>{discogsStatus.label}</Badge>
+                    <p className="text-xs leading-5 text-slate-400">{discogsStatus.message}</p>
+                    {discogsEnabled ? (
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between gap-3">
+                          <Label className="text-xs text-slate-200">User token</Label>
+                          <a href={METADATA_SOURCE_LINKS.discogs} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
+                            Get token
+                            <ExternalLink className="h-3 w-3" />
+                          </a>
+                        </div>
+                        <PasswordInput value={String(config.DISCOGS_USER_TOKEN || '')} onChange={(event) => updateConfig({ DISCOGS_USER_TOKEN: event.target.value })} placeholder="Discogs user token" />
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">iTunes / Apple Music</div>
+                        <p className="text-xs text-slate-400">No key required. Strong extra signal for covers and mainstream catalog cross-checks.</p>
+                      </div>
+                      <Switch checked={itunesEnabled} onCheckedChange={(checked) => updateConfig({ USE_ITUNES: checked })} />
+                    </div>
+                    <Badge variant={itunesStatus.variant}>{itunesStatus.label}</Badge>
+                    <p className="text-xs leading-5 text-slate-400">{itunesStatus.message}</p>
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">Deezer</div>
+                        <p className="text-xs text-slate-400">No key required. Useful for extra album metadata, genres and cover cross-checks.</p>
+                      </div>
+                      <Switch checked={deezerEnabled} onCheckedChange={(checked) => updateConfig({ USE_DEEZER: checked })} />
+                    </div>
+                    <Badge variant={deezerStatus.variant}>{deezerStatus.label}</Badge>
+                    <p className="text-xs leading-5 text-slate-400">{deezerStatus.message}</p>
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">Spotify</div>
+                        <p className="text-xs text-slate-400">No key required. Strong extra signal for title, year and cover recovery.</p>
+                      </div>
+                      <Switch checked={spotifyEnabled} onCheckedChange={(checked) => updateConfig({ USE_SPOTIFY: checked })} />
+                    </div>
+                    <Badge variant={spotifyStatus.variant}>{spotifyStatus.label}</Badge>
+                    <p className="text-xs leading-5 text-slate-400">{spotifyStatus.message}</p>
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">Qobuz</div>
+                        <p className="text-xs text-slate-400">No key required. Useful for store metadata, edition hints and cover fallback.</p>
+                      </div>
+                      <Switch checked={qobuzEnabled} onCheckedChange={(checked) => updateConfig({ USE_QOBUZ: checked })} />
+                    </div>
+                    <Badge variant={qobuzStatus.variant}>{qobuzStatus.label}</Badge>
+                    <p className="text-xs leading-5 text-slate-400">{qobuzStatus.message}</p>
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">TIDAL</div>
+                        <p className="text-xs text-slate-400">No key required. Best-effort public fallback for extra album metadata and artwork.</p>
+                      </div>
+                      <Switch checked={tidalEnabled} onCheckedChange={(checked) => updateConfig({ USE_TIDAL: checked })} />
+                    </div>
+                    <Badge variant={tidalStatus.variant}>{tidalStatus.label}</Badge>
+                    <p className="text-xs leading-5 text-slate-400">{tidalStatus.message}</p>
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">Last.fm</div>
+                        <p className="text-xs text-slate-400">Useful for genres and fallback artist metadata when other providers are incomplete.</p>
+                      </div>
+                      <Switch checked={lastfmEnabled} onCheckedChange={(checked) => updateConfig({ USE_LASTFM: checked })} />
+                    </div>
+                    <Badge variant={lastfmStatus.variant}>{lastfmStatus.label}</Badge>
+                    <p className="text-xs leading-5 text-slate-400">{lastfmStatus.message}</p>
+                    {lastfmEnabled ? (
+                      <div className="grid gap-2 md:grid-cols-2">
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between gap-3">
+                            <Label className="text-xs text-slate-200">API key</Label>
+                            <a href={METADATA_SOURCE_LINKS.lastfm} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
+                              Get key & secret
+                              <ExternalLink className="h-3 w-3" />
+                            </a>
+                          </div>
+                          <Input value={String(config.LASTFM_API_KEY || '')} onChange={(event) => updateConfig({ LASTFM_API_KEY: event.target.value })} placeholder="Last.fm API key" />
+                        </div>
+                        <div className="space-y-2">
+                          <Label className="text-xs text-slate-200">API secret</Label>
+                          <PasswordInput value={String(config.LASTFM_API_SECRET || '')} onChange={(event) => updateConfig({ LASTFM_API_SECRET: event.target.value })} placeholder="Last.fm API secret" />
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">AcoustID</div>
+                        <p className="text-xs text-slate-400">Useful when tags are missing and PMDA needs fingerprint-based identification.</p>
+                      </div>
+                      <Switch checked={acoustidEnabled} onCheckedChange={(checked) => updateConfig({ USE_ACOUSTID: checked })} />
+                    </div>
+                    <Badge variant={acoustidStatus.variant}>{acoustidStatus.label}</Badge>
+                    <p className="text-xs leading-5 text-slate-400">{acoustidStatus.message}</p>
+                    {acoustidEnabled ? (
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between gap-3">
+                          <Label className="text-xs text-slate-200">API key</Label>
+                          <a href={METADATA_SOURCE_LINKS.acoustid} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
+                            Get API key
+                            <ExternalLink className="h-3 w-3" />
+                          </a>
+                        </div>
+                        <PasswordInput value={String(config.ACOUSTID_API_KEY || '')} onChange={(event) => updateConfig({ ACOUSTID_API_KEY: event.target.value })} placeholder="AcoustID API key" />
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">Fanart.tv</div>
+                        <p className="text-xs text-slate-400">Optional. Adds extra MBID-based artist artwork when the main providers still leave gaps.</p>
+                      </div>
+                    </div>
+                    <Badge variant={fanartStatus.variant}>{fanartStatus.label}</Badge>
+                    <p className="text-xs leading-5 text-slate-400">{fanartStatus.message}</p>
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between gap-3">
+                        <Label className="text-xs text-slate-200">API key</Label>
+                        <a href={METADATA_SOURCE_LINKS.fanart} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
+                          Get API key
+                          <ExternalLink className="h-3 w-3" />
+                        </a>
+                      </div>
+                      <PasswordInput value={String(config.FANART_API_KEY || '')} onChange={(event) => updateConfig({ FANART_API_KEY: event.target.value })} placeholder="Fanart.tv API key" />
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">TheAudioDB</div>
+                        <p className="text-xs text-slate-400">Optional. Adds another artwork path for album covers and artist images when the stricter providers are still incomplete.</p>
+                      </div>
+                    </div>
+                    <Badge variant={audiodbStatus.variant}>{audiodbStatus.label}</Badge>
+                    <p className="text-xs leading-5 text-slate-400">{audiodbStatus.message}</p>
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between gap-3">
+                        <Label className="text-xs text-slate-200">API key</Label>
+                        <a href={METADATA_SOURCE_LINKS.audiodb} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
+                          Get API key
+                          <ExternalLink className="h-3 w-3" />
+                        </a>
+                      </div>
+                      <PasswordInput value={String(config.THEAUDIODB_API_KEY || '')} onChange={(event) => updateConfig({ THEAUDIODB_API_KEY: event.target.value })} placeholder="TheAudioDB API key" />
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3 lg:col-span-2">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">Serper</div>
+                        <p className="text-xs text-slate-400">Optional web-search backend. PMDA uses this when it needs outside evidence to resolve a MusicBrainz identity and you want a dedicated external search provider.</p>
+                      </div>
+                      <Switch checked={webSearchEnabled} onCheckedChange={(checked) => updateConfig({ USE_WEB_SEARCH_FOR_MB: checked })} />
+                    </div>
+                    <Badge variant={serperStatus.variant}>{serperStatus.label}</Badge>
+                    <p className="text-xs leading-5 text-slate-400">{serperStatus.message}</p>
+                    {webSearchEnabled ? (
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between gap-3">
+                          <Label className="text-xs text-slate-200">API key</Label>
+                          <a href={METADATA_SOURCE_LINKS.serper} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
+                            Get API key
+                            <ExternalLink className="h-3 w-3" />
+                          </a>
+                        </div>
+                        <PasswordInput value={String(config.SERPER_API_KEY || '')} onChange={(event) => updateConfig({ SERPER_API_KEY: event.target.value })} placeholder="Serper API key" />
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3 lg:col-span-2">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">Bandcamp</div>
+                        <p className="text-xs text-slate-400">Enabled by default. No key required. Keeps an additional fallback path for independent releases.</p>
+                      </div>
+                      <Switch checked={bandcampEnabled} onCheckedChange={(checked) => updateConfig({ USE_BANDCAMP: checked })} />
+                    </div>
+                    <Badge variant={bandcampStatus.variant}>{bandcampStatus.label}</Badge>
+                    <p className="text-xs leading-5 text-slate-400">{bandcampStatus.message}</p>
+                  </div>
+                </div>
+
+                <div className="space-y-4 rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+                  <div>
+                    <div className="text-sm font-semibold text-white">Match policy</div>
+                    <p className="mt-1 text-xs text-slate-400">Decide how conservative PMDA should be before it keeps a near-match. Soft matches are recommended for the first scan and stay grounded in provider evidence.</p>
+                  </div>
+                  <div className="grid gap-3 md:grid-cols-2">
+                    {[
+                      {
+                        value: 'soft' as const,
+                        label: 'Soft matches accepted',
+                        description: 'Recommended. Keeps strong near-matches alive, which helps obscure releases, alternate editions and provider enrichment.',
+                        tradeoff: 'More metadata lands automatically, but a few releases may still need manual review later.',
+                      },
+                      {
+                        value: 'perfect' as const,
+                        label: 'Perfect matches only',
+                        description: 'Use this if you want the most conservative scan and prefer PMDA to leave uncertain releases unmatched.',
+                        tradeoff: 'Safer library, but more albums will stay unmatched and fewer provider profiles will be pulled.',
+                      },
+                    ].map((option) => {
+                      const active = matchPolicy === option.value;
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          onClick={() => setMatchPolicy(option.value)}
+                          className={`rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="text-sm font-semibold text-white">{option.label}</div>
+                            {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                          </div>
+                          <p className="mt-2 text-xs leading-5 text-slate-300">{option.description}</p>
+                          <p className="mt-3 text-[11px] leading-5 text-slate-500">{option.tradeoff}</p>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {sourceIssues.length > 0 ? (
+                  <div className="rounded-2xl border border-amber-500/25 bg-amber-500/10 p-4 text-sm text-amber-100">
+                    <div className="flex items-center gap-2 font-medium">
+                      <AlertTriangle className="h-4 w-4" />
+                      Sources still need attention
+                    </div>
+                    <ul className="mt-2 space-y-1 text-xs text-amber-50/90">
+                      {sourceIssues.map((issue) => (
+                        <li key={issue}>• {issue}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : (
+                  <div className="rounded-2xl border border-emerald-500/25 bg-emerald-500/10 p-4 text-sm text-emerald-100">
+                    <div className="flex items-center gap-2 font-medium">
+                      <CheckCircle2 className="h-4 w-4" />
+                      Enabled sources are configured
+                    </div>
+                  </div>
+                )}
+              </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {activeStep === 5 ? (
+            <div className="space-y-5">
+              <div className="space-y-1">
+                <div className="text-sm font-semibold text-white">Define the matching and quarantine rules</div>
+                <p className="text-sm text-slate-400">Keep this simple: decide how strict matching should be, how PMDA should pick duplicate winners, and when an album is incomplete enough to leave the clean path.</p>
+              </div>
+
+              <div className="grid gap-5 xl:grid-cols-[1.15fr,0.85fr]">
+                <div className="space-y-5 rounded-3xl border border-white/10 bg-white/[0.03] p-5">
+                  <div>
+                    <div className="text-sm font-semibold text-white">Duplicates</div>
+                    <p className="mt-1 text-xs text-slate-400">Choose whether PMDA should ignore duplicates, flag them for review, or move the losing editions automatically.</p>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                    {[
+                      { value: 'ignore' as const, label: 'Ignore', description: 'Do not run the dedupe stage.' },
+                      { value: 'detect' as const, label: 'Detect only', description: 'Show duplicate groups but keep every edition in place.' },
+                      { value: 'move' as const, label: 'Detect and move', description: 'Move losing editions to the duplicates folder automatically.' },
+                    ].map((option) => {
+                      const active = dedupeMode === option.value;
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          onClick={() => setDedupeMode(option.value)}
+                          className={`min-h-[118px] rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="text-sm font-semibold text-white">{option.label}</div>
+                            {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                          </div>
+                          <p className="mt-2 text-xs leading-5 text-slate-400">{option.description}</p>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="space-y-3 rounded-2xl border border-white/10 bg-black/10 p-4">
+                    <div>
+                      <div className="text-sm font-semibold text-white">When two editions compete, what should win?</div>
+                      <p className="mt-1 text-xs text-slate-400">PMDA already prefers fuller tracklists when two releases are credible. This choice decides the audio bias on top of that.</p>
+                    </div>
+                    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                      {[
+                        {
+                          value: 'quality' as const,
+                          label: 'Best audio quality',
+                          description: 'Prefer the highest-fidelity codecs first, then use other signals to break ties.',
+                        },
+                        {
+                          value: 'balanced' as const,
+                          label: 'Balanced winner',
+                          description: 'Keep lossless near the top, but stay a bit more practical for mixed libraries.',
+                        },
+                        {
+                          value: 'compact' as const,
+                          label: 'Smaller files first',
+                          description: 'Prefer portable/compressed versions when quality is not the main priority.',
+                        },
+                      ].map((option) => {
+                        const active = dedupeFormatStrategy === option.value;
+                        return (
+                          <button
+                            key={option.value}
+                            type="button"
+                            onClick={() => setDedupeFormatStrategy(option.value)}
+                            className={`min-h-[128px] rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                          >
+                            <div className="flex items-center justify-between gap-3">
+                              <div className="text-sm font-semibold text-white">{option.label}</div>
+                              {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                            </div>
+                            <p className="mt-2 text-xs leading-5 text-slate-400">{option.description}</p>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="space-y-4">
+                    <div className="space-y-3 rounded-2xl border border-white/10 bg-black/10 p-4">
+                      <div>
+                        <div className="text-sm font-semibold text-white">Duplicate sensitivity</div>
+                        <p className="mt-1 text-xs text-slate-400">Use a safer mode when you want fewer false merges. Use broader grouping when your folders contain many variant suffixes for the same release.</p>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        {[
+                          {
+                            value: 'safe' as const,
+                            label: 'Safer grouping',
+                            description: 'Recommended. More conservative around edge cases and near-duplicates.',
+                          },
+                          {
+                            value: 'aggressive' as const,
+                            label: 'Broader grouping',
+                            description: 'Merges more borderline duplicate candidates, which can save time in noisier libraries.',
+                          },
+                        ].map((option) => {
+                          const active = dedupeSensitivity === option.value;
+                          return (
+                            <button
+                              key={option.value}
+                              type="button"
+                              onClick={() => setDedupeSensitivity(option.value)}
+                              className={`min-h-[110px] rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="text-sm font-semibold text-white">{option.label}</div>
+                                {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                              </div>
+                              <p className="mt-2 text-xs leading-5 text-slate-400">{option.description}</p>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                    <div className="rounded-2xl border border-white/10 bg-black/10 p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-semibold text-white">Treat suffixes as the same release</div>
+                          <p className="mt-1 text-xs text-slate-400">Examples: <span className="font-mono text-slate-200">Album (FLAC)</span> and <span className="font-mono text-slate-200">Album</span>.</p>
+                        </div>
+                        <Switch
+                          checked={config.NORMALIZE_PARENTHETICAL_FOR_DEDUPE ?? true}
+                          onCheckedChange={(checked) => updateConfig({ NORMALIZE_PARENTHETICAL_FOR_DEDUPE: checked })}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-5 rounded-3xl border border-white/10 bg-white/[0.03] p-5">
+                  <div>
+                    <div className="text-sm font-semibold text-white">Incomplete albums</div>
+                    <p className="mt-1 text-xs text-slate-400">Choose how strict PMDA should be before it moves a release into the incomplete folder.</p>
+                  </div>
+                  {[
+                    {
+                      value: 'keep' as const,
+                      label: 'Keep everything in place',
+                      description: 'Do not quarantine incomplete albums automatically.',
+                    },
+                    {
+                      value: 'obvious' as const,
+                      label: 'Move only obvious gaps',
+                      description: 'Recommended. Keeps likely alt editions in place, but moves releases with clear missing chunks.',
+                    },
+                    {
+                      value: 'strict' as const,
+                      label: 'Move even small gaps',
+                      description: 'Use this only if you want the clean library to reject near-complete albums too.',
+                    },
+                  ].map((option) => {
+                    const active = incompleteMode === option.value;
+                    return (
+                      <button
+                        key={option.value}
+                        type="button"
+                        onClick={() => setIncompleteHandling(option.value)}
+                        className={`min-h-[108px] rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="text-sm font-semibold text-white">{option.label}</div>
+                          {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                        </div>
+                        <p className="mt-2 text-xs leading-5 text-slate-400">{option.description}</p>
+                      </button>
+                    );
+                  })}
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">Keep repairing incomplete albums later</div>
+                        <p className="mt-1 text-xs text-slate-400">When on, future runs can keep trying to fill missing metadata or artwork for albums that were not complete yet.</p>
+                      </div>
+                      <Switch
+                        checked={Boolean(config.REPROCESS_INCOMPLETE_ALBUMS)}
+                        onCheckedChange={(checked) => updateConfig({ REPROCESS_INCOMPLETE_ALBUMS: checked })}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4 text-xs leading-6 text-slate-400">
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Current outcome</div>
+                    <p className="mt-2">
+                      Duplicates folder: <span className="font-mono text-slate-200">{dupesRoot || 'not set yet'}</span>
+                    </p>
+                    <p>
+                      Incomplete folder: <span className="font-mono text-slate-200">{incompleteRoot || 'not set yet'}</span>
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {activeStep === 6 ? (
+            <div className="space-y-5">
+              <div className="space-y-1">
+                <div className="text-sm font-semibold text-white">Choose the pipeline behavior</div>
+                <p className="text-sm text-slate-400">
+                  {auditMode
+                    ? 'This is still the execution layer, but audit keeps it read-only: PMDA can enrich the database view and review surfaces without publishing or moving files automatically.'
+                    : 'This is the execution layer: publish the clean library if needed, then optionally refresh a player when the run finishes.'}
+                </p>
+              </div>
+
+              <div className="space-y-4 rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+                  <div>
+                    <div className="text-sm font-semibold text-white">Write metadata into files</div>
+                    <p className="mt-1 text-xs text-slate-400">
+                      {auditMode
+                        ? 'Audit mode does not rewrite files automatically. Choose whether PMDA should stay DB-first (PMDA ID only) or be ready to write full tags later if you export from the database after review.'
+                        : 'Pick whether PMDA writes full tags into the files or keeps metadata only in the database (PMDA ID only). You can switch later to write tags from the PMDA database after review.'}
+                    </p>
+                  </div>
+                  <div className="grid gap-3 md:grid-cols-2">
+                    {([
+                      {
+                        value: 'full',
+                        label: 'Write tags into files',
+                        description: auditMode
+                          ? 'Deferred in audit mode. If you later export from PMDA, it will write enriched tags and artwork into your files.'
+                          : 'PMDA writes enriched tags and embeds artwork directly into your files.',
+                      },
+                      {
+                        value: 'pmda_id_only',
+                        label: 'DB-only (PMDA ID only)',
+                        description: auditMode
+                          ? 'Recommended for audit. PMDA keeps metadata in PostgreSQL and only relies on the PMDA database view until you explicitly export later.'
+                          : 'PMDA keeps metadata in PostgreSQL and only stores a PMDA ID tag on files.',
+                      },
+                    ] as const).map((option) => {
+                    const active = tagWriteMode === option.value;
+                    return (
+                      <button
+                        key={option.value}
+                        type="button"
+                        onClick={() => updateConfig({ FILES_TAG_WRITE_MODE: option.value })}
+                        className={`rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="text-sm font-semibold text-white">{option.label}</div>
+                          {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                        </div>
+                        <p className="mt-2 text-xs leading-5 text-slate-400">{option.description}</p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {auditMode ? (
+                <div className="rounded-3xl border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-100">
+                  <div className="font-semibold">Audit mode keeps the execution layer read-only</div>
+                  <p className="mt-2 text-xs leading-5 text-amber-50/90">
+                    PMDA will scan, match, enrich the database and expose review surfaces, but it will not publish a clean library, move duplicate losers, move incomplete albums, or refresh players automatically.
+                  </p>
+                </div>
+              ) : wantsPublishedLibrary ? (
+                <div className="space-y-4 rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+                  <div>
+                    <div className="text-sm font-semibold text-white">Publish a clean library</div>
+                    <p className="mt-1 text-xs text-slate-400">Because this workflow builds a clean result, PMDA should publish it by default. You can still switch it off explicitly.</p>
+                  </div>
+                  <div className="grid gap-3 md:grid-cols-2">
+                    {[
+                      { value: true, label: 'Yes, publish it', description: 'Build the clean serving library after the scan.' },
+                      { value: false, label: 'No, keep publish off', description: 'Only analyze and organize without building the clean serving tree.' },
+                    ].map((option) => {
+                      const active = publishLibraryEnabled === option.value;
+                      return (
+                        <button
+                          key={String(option.value)}
+                          type="button"
+                          onClick={() => updateConfig({ PIPELINE_ENABLE_EXPORT: option.value })}
+                          className={`rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="text-sm font-semibold text-white">{option.label}</div>
+                            {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                          </div>
+                          <p className="mt-2 text-xs leading-5 text-slate-400">{option.description}</p>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {publishLibraryEnabled ? (
+                    <div className="space-y-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">Materialization method</div>
+                        <p className="mt-1 text-xs text-slate-400">Choose how PMDA should build the published library on disk.</p>
+                      </div>
+                      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                        {MATERIALIZATION_OPTIONS.map((option) => {
+                          const active = materializationMode === option.value;
+                          return (
+                            <button
+                              key={option.value}
+                              type="button"
+                              onClick={() => updateConfig({ EXPORT_LINK_STRATEGY: option.value, LIBRARY_MATERIALIZATION_MODE: option.value })}
+                              className={`rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="text-sm font-semibold text-white">{option.label}</div>
+                                {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                              </div>
+                              <p className="mt-2 text-xs leading-5 text-slate-400">{option.description}</p>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-4 text-sm text-slate-300">
+                  This workflow serves the current library directly, so PMDA will not build a second published tree.
+                </div>
+              )}
+
+              {auditMode ? (
+                <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-4 text-sm text-slate-300">
+                  Player sync stays unavailable in audit mode. External players remain untouched until you switch workflow or trigger a later explicit export or sync path.
+                </div>
+              ) : (
+                <div className="space-y-4 rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+                  <div>
+                    <div className="text-sm font-semibold text-white">Player sync</div>
+                    <p className="mt-1 text-xs text-slate-400">Optional. Choose a target only if you want PMDA to refresh a player right after the pipeline.</p>
+                  </div>
+                  <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                    {PLAYER_TARGET_OPTIONS.map((option) => {
+                      const active = playerTarget === option.value;
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          onClick={() => setPlayerTarget(option.value)}
+                          className={`rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="text-sm font-semibold text-white">{option.label}</div>
+                            {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                          </div>
+                          <p className="mt-2 text-xs leading-5 text-slate-400">{option.description}</p>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {playerTarget === 'plex' ? (
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <div className="space-y-2">
+                        <Label className="text-xs text-slate-200">Plex URL</Label>
+                        <Input value={String(config.PLEX_HOST || '')} onChange={(event) => updateConfig({ PLEX_HOST: event.target.value })} placeholder="http://plex:32400" />
+                      </div>
+                      <div className="space-y-2">
+                        <Label className="text-xs text-slate-200">Plex token</Label>
+                        <PasswordInput value={String(config.PLEX_TOKEN || '')} onChange={(event) => updateConfig({ PLEX_TOKEN: event.target.value })} placeholder={config.PLEX_TOKEN_SET ? 'Stored token unchanged' : 'Plex token'} />
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {playerTarget === 'jellyfin' ? (
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <div className="space-y-2">
+                        <Label className="text-xs text-slate-200">Jellyfin URL</Label>
+                        <Input value={String(config.JELLYFIN_URL || '')} onChange={(event) => updateConfig({ JELLYFIN_URL: event.target.value })} placeholder="http://jellyfin:8096" />
+                      </div>
+                      <div className="space-y-2">
+                        <Label className="text-xs text-slate-200">Jellyfin API key</Label>
+                        <PasswordInput value={String(config.JELLYFIN_API_KEY || '')} onChange={(event) => updateConfig({ JELLYFIN_API_KEY: event.target.value })} placeholder="Jellyfin API key" />
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {playerTarget === 'navidrome' ? (
+                    <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                      <div className="space-y-2">
+                        <Label className="text-xs text-slate-200">Navidrome URL</Label>
+                        <Input value={String(config.NAVIDROME_URL || '')} onChange={(event) => updateConfig({ NAVIDROME_URL: event.target.value })} placeholder="http://navidrome:4533" />
+                      </div>
+                      <div className="space-y-2">
+                        <Label className="text-xs text-slate-200">API key (optional)</Label>
+                        <PasswordInput value={String(config.NAVIDROME_API_KEY || '')} onChange={(event) => updateConfig({ NAVIDROME_API_KEY: event.target.value })} placeholder="Navidrome API key" />
+                      </div>
+                      <div className="space-y-2">
+                        <Label className="text-xs text-slate-200">Username / password fallback</Label>
+                        <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-1">
+                          <Input value={String(config.NAVIDROME_USERNAME || '')} onChange={(event) => updateConfig({ NAVIDROME_USERNAME: event.target.value })} placeholder="Username" />
+                          <PasswordInput value={String(config.NAVIDROME_PASSWORD || '')} onChange={(event) => updateConfig({ NAVIDROME_PASSWORD: event.target.value })} placeholder="Password" />
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {!playerSyncReady ? (
+                    <div className="rounded-2xl border border-amber-500/25 bg-amber-500/10 p-4 text-sm text-amber-100">
+                      <div className="flex items-center gap-2 font-medium">
+                        <AlertTriangle className="h-4 w-4" />
+                        Player sync still needs credentials
+                      </div>
+                      <p className="mt-2 text-xs text-amber-50/90">Complete the credentials for the selected target or switch player sync off for the first scan.</p>
+                    </div>
+                  ) : null}
+                </div>
+              )}
+            </div>
+          ) : null}
+
+          {activeStep === 7 ? (
+            <div className="space-y-5">
+              <div className="space-y-1">
+                <div className="text-sm font-semibold text-white">Set the scan behavior</div>
+                <p className="text-sm text-slate-400">
+                  Keep the first run easy to reason about: decide whether PMDA stays scan-first or may continue with scheduled and background work afterwards.
+                </p>
+              </div>
+
+              <ScanBehaviorSettingsPanel config={config} updateConfig={updateConfig} />
+            </div>
+          ) : null}
+
+          {activeStep === 8 ? (
+            <div className="space-y-5">
+              <div className="space-y-1">
+                <div className="text-sm font-semibold text-white">Review before the first full scan</div>
+                <p className="text-sm text-slate-400">This is the compact summary of what PMDA will actually do when you launch the first scan.</p>
+              </div>
+
+              <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+                <div className="space-y-3">
+                  {reviewRows.map((row) => (
+                    <div key={row.label} className="flex flex-col gap-3 rounded-2xl border border-white/10 bg-black/10 p-4 lg:flex-row lg:items-center lg:justify-between">
+                      <div className="min-w-0">
+                        <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">{row.label}</div>
+                        <div className="mt-1 text-sm font-semibold text-white">{row.value}</div>
+                        <p className="mt-1 text-xs leading-5 text-slate-400">{row.detail}</p>
+                      </div>
+                      <Button type="button" variant="outline" size="sm" onClick={() => void goToStep(row.step)}>
+                        Modify
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {blockers.length > 0 ? (
+                <div className="rounded-3xl border border-amber-500/25 bg-amber-500/10 p-4 text-sm text-amber-100">
+                  <div className="flex items-center gap-2 font-medium">
+                    <AlertTriangle className="h-4 w-4" />
+                    One last thing needs attention
+                  </div>
+                  <p className="mt-2 text-xs text-amber-50/90">{blockers[0]?.detail}</p>
+                </div>
+              ) : (
+                <div className="rounded-3xl border border-emerald-500/25 bg-emerald-500/10 p-4 text-sm text-emerald-100">
+                  <div className="flex items-center gap-2 font-medium">
+                    <CheckCircle2 className="h-4 w-4" />
+                    Minimum setup complete
+                  </div>
+                  <p className="mt-2 text-xs text-emerald-50/90">PMDA has the minimum safe setup to launch or resume the first full scan.</p>
+                </div>
+              )}
+
+              {firstScanStarted ? (
+                <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+                  <div className="flex items-center justify-between gap-3 text-sm text-white">
+                    <div className="font-medium">
+                      {scanProgress?.scanning ? `Current phase: ${scanProgress.phase || 'running'}` : 'A scan has already been started'}
+                    </div>
+                    <Badge variant="outline" className="border-white/15 bg-white/5 text-slate-200">
+                      {Math.round(scanProgressPercent)}%
+                    </Badge>
+                  </div>
+                  <Progress value={Math.max(0, Math.min(100, scanProgressPercent))} className="mt-3 h-2 bg-white/10" />
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          <div className="flex flex-col gap-3 border-t border-white/10 pt-5 sm:flex-row sm:items-center sm:justify-between">
+            <Button type="button" variant="outline" onClick={() => void goToStep(activeStep - 1)} disabled={activeStep === 0 || isSaving}>
+              Previous
+            </Button>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+              {activeStep < STEP_ORDER.length - 1 ? (
+                <Button
+                  type="button"
+                  className="gap-2"
+                  onClick={() => void handleNextStep()}
+                  disabled={
+                    isSaving
+                    || runtimeActionBusy
+                    || (activeStep === 1 && !foldersReady)
+                    || (activeStep === 3 && !runtimeSetupReady)
+                    || (activeStep === 4 && !sourcesStepReady)
+                    || (activeStep === 5 && !rulesReady)
+                    || (activeStep === 6 && !pipelineConfigReady)
+                  }
+                >
+                  {isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  {activeStep === 2 && localStackNeedsConfirmation ? 'Continue' : activeStep === 6 ? 'Scan behavior' : activeStep === 7 ? 'Review first scan' : 'Next'}
+                </Button>
+              ) : (
+                <Button type="button" className="gap-2" onClick={() => void startOrResumeScan()} disabled={scanActionBusy || !launchReady}>
+                  {scanActionBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlayCircle className="h-4 w-4" />}
+                  {scanProgress?.resume_available && !scanProgress?.scanning ? 'Resume scan' : scanProgress?.scanning ? 'Open scan' : firstScanStarted && !Boolean(bootstrap?.bootstrap_required) ? 'Open scan' : 'Start first full scan'}
+                </Button>
+              )}
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <AlertDialog open={localStackConfirmOpen} onOpenChange={setLocalStackConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {localStackDetectedCount > 0 ? 'Use the detected local metadata stack now?' : 'Create the local metadata stack now?'}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {externalLocalStackReady
+                ? 'PMDA detected a reachable MusicBrainz mirror and Ollama runtime from your configured URLs. No new containers will be created.'
+                : (
+                  <>
+                    PMDA will create or adopt the local MusicBrainz mirror and Ollama runtime, then download the required AI models
+                    <span className="font-mono"> {ollamaModel}</span>
+                    {' '}and
+                    <span className="font-mono"> {ollamaHardModel}</span>.
+                  </>
+                )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="space-y-3 text-sm text-muted-foreground">
+            <p>Make sure <span className="font-mono text-foreground">{resolvedManagedDataRoot}</span> has at least <span className="font-semibold text-foreground">{LOCAL_STACK_RECOMMENDED_FREE_GB} GB</span> free. The MusicBrainz import is disk-intensive and the full setup can take a while depending on your connection and storage.</p>
+            <p>After confirmation, the next step becomes a compact live progress view with the real MusicBrainz / Ollama status.</p>
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={runtimeActionBusy}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={runtimeActionBusy}
+              onClick={(event) => {
+                event.preventDefault();
+                void confirmAndStartLocalStack();
+              }}
+            >
+              {runtimeActionBusy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              {localStackActionLabel}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+}

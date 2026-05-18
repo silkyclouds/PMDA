@@ -1,6 +1,7 @@
 import { AlbumCommunitySignals } from '@/components/library/AlbumCommunitySignals';
 import { FormatBadge } from '@/components/FormatBadge';
 import { Badge } from '@/components/ui/badge';
+import { formatAudioSpec } from '@/lib/audioFormat';
 import { badgeKindClass } from '@/lib/badgeStyles';
 import { cn } from '@/lib/utils';
 
@@ -12,6 +13,8 @@ type AlbumBadgeGroupsProps = {
   publicRatingVotes?: number | null;
   format?: string | null;
   isLossless?: boolean | null;
+  sampleRate?: number | null;
+  bitDepth?: number | null;
   year?: number | string | null;
   trackCount?: number | null;
   genres?: string[] | null;
@@ -43,6 +46,8 @@ export function AlbumBadgeGroups({
   publicRatingVotes,
   format,
   isLossless,
+  sampleRate,
+  bitDepth,
   year,
   trackCount,
   genres,
@@ -55,8 +60,10 @@ export function AlbumBadgeGroups({
   const cleanGenres = normalizeGenres(genres);
   const cleanLabelRaw = String(label || '').trim();
   const cleanLabel = cleanLabelRaw && cleanLabelRaw.toLowerCase() !== 'unknown' ? cleanLabelRaw : '';
+  const audioSpec = formatAudioSpec(bitDepth, sampleRate);
   const hasPulse = Number(userRating || 0) > 0 || Number(publicRating || 0) > 0;
-  const hasAlbumFacts = Boolean(String(format || '').trim()) || typeof isLossless === 'boolean' || Number(year || 0) > 0 || Number(trackCount || 0) > 0;
+  const audioBadgeText = audioSpec || (isLossless === false ? 'Lossy' : '');
+  const hasAlbumFacts = Boolean(String(format || '').trim()) || Boolean(audioBadgeText) || Number(year || 0) > 0 || Number(trackCount || 0) > 0;
   const hasTaxonomy = cleanGenres.length > 0 || Boolean(cleanLabel);
   const headingClass = compact
     ? 'text-[10px] font-medium uppercase tracking-[0.18em] text-muted-foreground/80'
@@ -83,12 +90,12 @@ export function AlbumBadgeGroups({
           <div className={headingClass}>Album</div>
           <div className="flex flex-wrap items-center gap-1.5">
             {String(format || '').trim() ? <FormatBadge format={String(format)} size="sm" /> : null}
-            {typeof isLossless === 'boolean' ? (
+            {audioBadgeText ? (
               <Badge
                 variant="outline"
                 className={cn(badgeClass, isLossless ? badgeKindClass('lossless') : badgeKindClass('lossy'))}
               >
-                {isLossless ? 'Lossless' : 'Lossy'}
+                {audioBadgeText}
               </Badge>
             ) : null}
             {Number(year || 0) > 0 ? (

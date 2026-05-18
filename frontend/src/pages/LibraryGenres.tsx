@@ -14,7 +14,7 @@ import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 export default function LibraryGenres() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { includeUnmatched, libraryIsEmpty } = useOutletContext<LibraryOutletContext>();
+  const { includeUnmatched, scope, libraryIsEmpty, emptyState, setScope } = useOutletContext<LibraryOutletContext>();
   const { search, label, year } = useLibraryQuery();
 
   const [loading, setLoading] = useState(false);
@@ -41,6 +41,7 @@ export default function LibraryGenres() {
         label: label || undefined,
         year: year ?? undefined,
         includeUnmatched,
+        scope,
         limit,
         offset: opts.pageOffset,
       });
@@ -60,7 +61,7 @@ export default function LibraryGenres() {
     } finally {
       if (rid === requestIdRef.current) setLoading(false);
     }
-  }, [includeUnmatched, label, limit, search, year]);
+  }, [includeUnmatched, label, limit, scope, search, year]);
 
   useEffect(() => {
     if (libraryIsEmpty) {
@@ -108,7 +109,12 @@ export default function LibraryGenres() {
   if (libraryIsEmpty) {
     return (
       <div className="pmda-library-shell pb-6">
-        <LibraryEmptyState />
+        <LibraryEmptyState
+          title={emptyState.title}
+          description={emptyState.description}
+          actionLabel={emptyState.actionLabel ?? undefined}
+          onAction={emptyState.actionScope ? () => setScope(emptyState.actionScope as api.LibraryBrowseScope) : undefined}
+        />
       </div>
     );
   }

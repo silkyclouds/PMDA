@@ -1,4 +1,4 @@
-import type { PMDAConfig } from '@/lib/api';
+import type { LibraryBrowseScope, PMDAConfig } from '@/lib/api';
 
 /** Coerce API value to boolean (API may return string "True"/"False" from SQLite). */
 function toBool(v: unknown): boolean {
@@ -84,10 +84,28 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
     out.TASK_NOTIFICATIONS_COOLDOWN_SEC = Math.max(0, Math.min(3600, Number(out.TASK_NOTIFICATIONS_COOLDOWN_SEC) || 0));
   }
   if (out.LIBRARY_INCLUDE_UNMATCHED !== undefined) out.LIBRARY_INCLUDE_UNMATCHED = toBool(out.LIBRARY_INCLUDE_UNMATCHED);
+  if (out.LIBRARY_INCLUDE_FORMAT_IN_FOLDER !== undefined) out.LIBRARY_INCLUDE_FORMAT_IN_FOLDER = toBool(out.LIBRARY_INCLUDE_FORMAT_IN_FOLDER);
+  if (out.LIBRARY_INCLUDE_TYPE_IN_FOLDER !== undefined) out.LIBRARY_INCLUDE_TYPE_IN_FOLDER = toBool(out.LIBRARY_INCLUDE_TYPE_IN_FOLDER);
+  if (out.LIBRARY_HAS_INTAKE !== undefined) out.LIBRARY_HAS_INTAKE = toBool(out.LIBRARY_HAS_INTAKE);
+  if (out.MUSICBRAINZ_MIRROR_ENABLED !== undefined) out.MUSICBRAINZ_MIRROR_ENABLED = toBool(out.MUSICBRAINZ_MIRROR_ENABLED);
+  if (out.MUSICBRAINZ_REPLICATION_TOKEN_SET !== undefined) out.MUSICBRAINZ_REPLICATION_TOKEN_SET = toBool(out.MUSICBRAINZ_REPLICATION_TOKEN_SET);
+  if (out.PROVIDER_GATEWAY_ENABLED !== undefined) out.PROVIDER_GATEWAY_ENABLED = toBool(out.PROVIDER_GATEWAY_ENABLED);
+  if (out.PROVIDER_GATEWAY_CACHE_ENABLED !== undefined) out.PROVIDER_GATEWAY_CACHE_ENABLED = toBool(out.PROVIDER_GATEWAY_CACHE_ENABLED);
+  if (out.AUTO_TUNE_ENABLED !== undefined) out.AUTO_TUNE_ENABLED = toBool(out.AUTO_TUNE_ENABLED);
+  if (out.MANAGED_MUSICBRAINZ_UPDATE_ENABLED !== undefined) out.MANAGED_MUSICBRAINZ_UPDATE_ENABLED = toBool(out.MANAGED_MUSICBRAINZ_UPDATE_ENABLED);
+  if (out.METADATA_QUEUE_ENABLED !== undefined) out.METADATA_QUEUE_ENABLED = toBool(out.METADATA_QUEUE_ENABLED);
+  if (out.USE_ITUNES !== undefined) out.USE_ITUNES = toBool(out.USE_ITUNES);
+  if (out.USE_DEEZER !== undefined) out.USE_DEEZER = toBool(out.USE_DEEZER);
+  if (out.USE_SPOTIFY !== undefined) out.USE_SPOTIFY = toBool(out.USE_SPOTIFY);
+  if (out.USE_QOBUZ !== undefined) out.USE_QOBUZ = toBool(out.USE_QOBUZ);
+  if (out.USE_TIDAL !== undefined) out.USE_TIDAL = toBool(out.USE_TIDAL);
+  if (out.EXPORT_INCLUDE_ALBUM_FORMAT_IN_FOLDER !== undefined) out.EXPORT_INCLUDE_ALBUM_FORMAT_IN_FOLDER = toBool(out.EXPORT_INCLUDE_ALBUM_FORMAT_IN_FOLDER);
+  if (out.EXPORT_INCLUDE_ALBUM_TYPE_IN_FOLDER !== undefined) out.EXPORT_INCLUDE_ALBUM_TYPE_IN_FOLDER = toBool(out.EXPORT_INCLUDE_ALBUM_TYPE_IN_FOLDER);
   if (out.NORMALIZE_PARENTHETICAL_FOR_DEDUPE !== undefined) out.NORMALIZE_PARENTHETICAL_FOR_DEDUPE = toBool(out.NORMALIZE_PARENTHETICAL_FOR_DEDUPE);
   if (out.BACKUP_BEFORE_FIX !== undefined) out.BACKUP_BEFORE_FIX = toBool(out.BACKUP_BEFORE_FIX);
   if (out.MAGIC_MODE !== undefined) out.MAGIC_MODE = toBool(out.MAGIC_MODE);
   if (out.REPROCESS_INCOMPLETE_ALBUMS !== undefined) out.REPROCESS_INCOMPLETE_ALBUMS = toBool(out.REPROCESS_INCOMPLETE_ALBUMS);
+  if (out.MCP_ENABLED !== undefined) out.MCP_ENABLED = toBool(out.MCP_ENABLED);
   if (out.IMPROVE_ALL_WORKERS !== undefined) out.IMPROVE_ALL_WORKERS = Math.max(1, Math.min(8, Number(out.IMPROVE_ALL_WORKERS) || 1));
   if (out.FFPROBE_POOL_SIZE !== undefined) out.FFPROBE_POOL_SIZE = Math.max(1, Math.min(64, Number(out.FFPROBE_POOL_SIZE) || 8));
   if (out.ARTWORK_RAM_CACHE_MB !== undefined) out.ARTWORK_RAM_CACHE_MB = Math.max(0, Math.min(65536, Number(out.ARTWORK_RAM_CACHE_MB) || 0));
@@ -96,6 +114,24 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
   if (out.ARTWORK_RAM_CACHE_AUTO !== undefined) out.ARTWORK_RAM_CACHE_AUTO = toBool(out.ARTWORK_RAM_CACHE_AUTO);
   if (out.ARTWORK_RAM_CACHE_AUTO_MAX_MB !== undefined) out.ARTWORK_RAM_CACHE_AUTO_MAX_MB = Math.max(0, Math.min(65536, Number(out.ARTWORK_RAM_CACHE_AUTO_MAX_MB) || 0));
   if (out.ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC !== undefined) out.ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC = Math.max(30, Math.min(3600, Number(out.ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC) || 120));
+  if (out.PROVIDER_GATEWAY_MAX_INFLIGHT !== undefined) out.PROVIDER_GATEWAY_MAX_INFLIGHT = Math.max(1, Math.min(256, Number(out.PROVIDER_GATEWAY_MAX_INFLIGHT) || 16));
+  if (out.PROVIDER_GATEWAY_DISCOGS_RPM !== undefined) out.PROVIDER_GATEWAY_DISCOGS_RPM = Math.max(1, Math.min(600, Number(out.PROVIDER_GATEWAY_DISCOGS_RPM) || 40));
+  if (out.PROVIDER_GATEWAY_ITUNES_RPM !== undefined) out.PROVIDER_GATEWAY_ITUNES_RPM = Math.max(1, Math.min(1200, Number(out.PROVIDER_GATEWAY_ITUNES_RPM) || 180));
+  if (out.PROVIDER_GATEWAY_DEEZER_RPM !== undefined) out.PROVIDER_GATEWAY_DEEZER_RPM = Math.max(1, Math.min(1200, Number(out.PROVIDER_GATEWAY_DEEZER_RPM) || 120));
+  if (out.PROVIDER_GATEWAY_SPOTIFY_RPM !== undefined) out.PROVIDER_GATEWAY_SPOTIFY_RPM = Math.max(1, Math.min(1200, Number(out.PROVIDER_GATEWAY_SPOTIFY_RPM) || 60));
+  if (out.PROVIDER_GATEWAY_QOBUZ_RPM !== undefined) out.PROVIDER_GATEWAY_QOBUZ_RPM = Math.max(1, Math.min(1200, Number(out.PROVIDER_GATEWAY_QOBUZ_RPM) || 40));
+  if (out.PROVIDER_GATEWAY_TIDAL_RPM !== undefined) out.PROVIDER_GATEWAY_TIDAL_RPM = Math.max(1, Math.min(1200, Number(out.PROVIDER_GATEWAY_TIDAL_RPM) || 20));
+  if (out.PROVIDER_GATEWAY_LASTFM_RPM !== undefined) out.PROVIDER_GATEWAY_LASTFM_RPM = Math.max(1, Math.min(1200, Number(out.PROVIDER_GATEWAY_LASTFM_RPM) || 120));
+  if (out.PROVIDER_GATEWAY_AUDIODB_RPM !== undefined) out.PROVIDER_GATEWAY_AUDIODB_RPM = Math.max(1, Math.min(1200, Number(out.PROVIDER_GATEWAY_AUDIODB_RPM) || 60));
+  if (out.PROVIDER_GATEWAY_BANDCAMP_RPM !== undefined) out.PROVIDER_GATEWAY_BANDCAMP_RPM = Math.max(1, Math.min(240, Number(out.PROVIDER_GATEWAY_BANDCAMP_RPM) || 12));
+  if (out.AUTO_TUNE_INTERVAL_SEC !== undefined) out.AUTO_TUNE_INTERVAL_SEC = Math.max(15, Math.min(900, Number(out.AUTO_TUNE_INTERVAL_SEC) || 60));
+  if (out.AUTO_TUNE_MB_MIRROR_MIN_RPS !== undefined) out.AUTO_TUNE_MB_MIRROR_MIN_RPS = Math.max(1, Math.min(100, Number(out.AUTO_TUNE_MB_MIRROR_MIN_RPS) || 12));
+  if (out.AUTO_TUNE_MB_MIRROR_MAX_RPS !== undefined) out.AUTO_TUNE_MB_MIRROR_MAX_RPS = Math.max(1, Math.min(100, Number(out.AUTO_TUNE_MB_MIRROR_MAX_RPS) || 20));
+  if (out.AUTO_TUNE_PROVIDER_MAX_INFLIGHT_MIN !== undefined) out.AUTO_TUNE_PROVIDER_MAX_INFLIGHT_MIN = Math.max(1, Math.min(256, Number(out.AUTO_TUNE_PROVIDER_MAX_INFLIGHT_MIN) || 8));
+  if (out.AUTO_TUNE_PROVIDER_MAX_INFLIGHT_CAP !== undefined) out.AUTO_TUNE_PROVIDER_MAX_INFLIGHT_CAP = Math.max(1, Math.min(256, Number(out.AUTO_TUNE_PROVIDER_MAX_INFLIGHT_CAP) || 32));
+  if (out.MANAGED_MUSICBRAINZ_REINDEX_INTERVAL_HOURS !== undefined) out.MANAGED_MUSICBRAINZ_REINDEX_INTERVAL_HOURS = Math.max(1, Math.min(24 * 30, Number(out.MANAGED_MUSICBRAINZ_REINDEX_INTERVAL_HOURS) || 24 * 7));
+  if (out.METADATA_WORKER_COUNT !== undefined) out.METADATA_WORKER_COUNT = Math.max(0, Math.min(128, Number(out.METADATA_WORKER_COUNT) || 0));
+  if (out.METADATA_JOB_BATCH_SIZE !== undefined) out.METADATA_JOB_BATCH_SIZE = Math.max(0, Math.min(500, Number(out.METADATA_JOB_BATCH_SIZE) || 0));
   if (out.USE_ACOUSTID !== undefined) out.USE_ACOUSTID = toBool(out.USE_ACOUSTID);
   if (out.USE_ACOUSTID_WHEN_TAGGED !== undefined) out.USE_ACOUSTID_WHEN_TAGGED = toBool(out.USE_ACOUSTID_WHEN_TAGGED);
   if (out.LASTFM_SCROBBLE_ENABLED !== undefined) out.LASTFM_SCROBBLE_ENABLED = toBool(out.LASTFM_SCROBBLE_ENABLED);
@@ -117,9 +153,6 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
       out.FORMAT_PREFERENCE = undefined;
     }
   }
-  if (out.SECTION_IDS != null && Array.isArray(out.SECTION_IDS)) {
-    out.SECTION_IDS = (out.SECTION_IDS as unknown as (string | number)[]).map((x) => String(x)).join(',');
-  }
   if (out.PATH_MAP != null && typeof out.PATH_MAP === 'string') {
     try {
       out.PATH_MAP = JSON.parse(out.PATH_MAP as unknown as string) as Record<string, string>;
@@ -130,6 +163,47 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
   if (out.FILES_ROOTS != null) {
     const roots = parsePathList(out.FILES_ROOTS as unknown);
     out.FILES_ROOTS = roots.join(', ');
+  }
+  if (out.LIBRARY_INTAKE_ROOTS != null) {
+    out.LIBRARY_INTAKE_ROOTS = parsePathList(out.LIBRARY_INTAKE_ROOTS as unknown).join(', ');
+  }
+  if (out.LIBRARY_SOURCE_ROOTS != null) {
+    out.LIBRARY_SOURCE_ROOTS = parsePathList(out.LIBRARY_SOURCE_ROOTS as unknown).join(', ');
+  }
+  if (out.LIBRARY_VISIBLE_SCOPES != null) {
+    const scopes = parsePathList(out.LIBRARY_VISIBLE_SCOPES as unknown)
+      .map((item) => String(item).trim().toLowerCase())
+      .filter((item): item is LibraryBrowseScope => (
+        ['library', 'inbox', 'dupes', 'all'].includes(item)
+      ));
+    out.LIBRARY_VISIBLE_SCOPES = scopes;
+  }
+  if (out.LIBRARY_EFFECTIVE_SCAN_ROOTS != null) {
+    out.LIBRARY_EFFECTIVE_SCAN_ROOTS = parsePathList(out.LIBRARY_EFFECTIVE_SCAN_ROOTS as unknown).join(', ');
+  }
+  if (out.LIBRARY_EFFECTIVE_LIBRARY_ROOTS != null) {
+    out.LIBRARY_EFFECTIVE_LIBRARY_ROOTS = parsePathList(out.LIBRARY_EFFECTIVE_LIBRARY_ROOTS as unknown).join(', ');
+  }
+  if (out.LIBRARY_EFFECTIVE_INBOX_ROOTS != null) {
+    out.LIBRARY_EFFECTIVE_INBOX_ROOTS = parsePathList(out.LIBRARY_EFFECTIVE_INBOX_ROOTS as unknown).join(', ');
+  }
+  if (out.LIBRARY_WORKFLOW_MODE != null) {
+    const mode = String(out.LIBRARY_WORKFLOW_MODE).trim().toLowerCase();
+    out.LIBRARY_WORKFLOW_MODE = (
+      ['managed', 'mirror', 'inplace', 'custom', 'audit'].includes(mode) ? mode : 'managed'
+    ) as PMDAConfig['LIBRARY_WORKFLOW_MODE'];
+  }
+  if (out.LIBRARY_MATERIALIZATION_MODE != null) {
+    const strategy = String(out.LIBRARY_MATERIALIZATION_MODE).trim().toLowerCase();
+    out.LIBRARY_MATERIALIZATION_MODE = (
+      ['move', 'hardlink', 'symlink', 'copy'].includes(strategy) ? strategy : 'hardlink'
+    ) as PMDAConfig['LIBRARY_MATERIALIZATION_MODE'];
+  }
+  if (out.METADATA_WORKER_MODE != null) {
+    const mode = String(out.METADATA_WORKER_MODE).trim().toLowerCase();
+    out.METADATA_WORKER_MODE = (
+      ['local', 'hybrid'].includes(mode) ? mode : 'local'
+    ) as PMDAConfig['METADATA_WORKER_MODE'];
   }
   if (out.WINNER_SOURCE_ROOT_ID != null) {
     const sid = Number(out.WINNER_SOURCE_ROOT_ID);
@@ -143,7 +217,7 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
   }
   if (out.PIPELINE_PLAYER_TARGET != null) {
     const target = String(out.PIPELINE_PLAYER_TARGET).trim().toLowerCase();
-    out.PIPELINE_PLAYER_TARGET = (['none', 'plex', 'jellyfin', 'navidrome'].includes(target) ? target : 'none') as PMDAConfig['PIPELINE_PLAYER_TARGET'];
+    out.PIPELINE_PLAYER_TARGET = (['none', 'jellyfin', 'navidrome'].includes(target) ? target : 'none') as PMDAConfig['PIPELINE_PLAYER_TARGET'];
   }
   if (out.AI_USAGE_LEVEL != null) {
     const level = String(out.AI_USAGE_LEVEL).trim().toLowerCase();
@@ -158,8 +232,20 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
   if (out.WEB_SEARCH_PROVIDER != null) {
     const provider = String(out.WEB_SEARCH_PROVIDER).trim().toLowerCase();
     out.WEB_SEARCH_PROVIDER = (
-      ['auto', 'searxng', 'serper', 'ai_only', 'disabled'].includes(provider) ? provider : 'auto'
+      ['auto', 'serper', 'ollama', 'ai_only', 'disabled'].includes(provider) ? provider : 'auto'
     ) as PMDAConfig['WEB_SEARCH_PROVIDER'];
+  }
+  if (out.MUSICBRAINZ_RUNTIME_MODE != null) {
+    const mode = String(out.MUSICBRAINZ_RUNTIME_MODE).trim().toLowerCase();
+    out.MUSICBRAINZ_RUNTIME_MODE = (
+      ['managed', 'adopted', 'external', 'absent'].includes(mode) ? mode : 'external'
+    ) as PMDAConfig['MUSICBRAINZ_RUNTIME_MODE'];
+  }
+  if (out.OLLAMA_RUNTIME_MODE != null) {
+    const mode = String(out.OLLAMA_RUNTIME_MODE).trim().toLowerCase();
+    out.OLLAMA_RUNTIME_MODE = (
+      ['managed', 'adopted', 'external', 'absent'].includes(mode) ? mode : 'external'
+    ) as PMDAConfig['OLLAMA_RUNTIME_MODE'];
   }
   if (out.CLASSICAL_NAME_PREFERENCE != null) {
     const value = String(out.CLASSICAL_NAME_PREFERENCE).trim().toLowerCase();

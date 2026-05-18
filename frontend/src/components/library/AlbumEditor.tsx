@@ -13,7 +13,7 @@ interface AlbumEditorProps {
   albumId: number;
   albumTitle: string;
   artistName: string;
-  /** Plex thumbnail URL for album cover (from Library browser). */
+  /** Album cover URL from the library browser. */
   albumThumb?: string | null;
   /** Primary audio format (e.g. MP3, FLAC). */
   format?: string;

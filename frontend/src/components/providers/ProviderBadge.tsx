@@ -28,10 +28,10 @@ export function ProviderBadge({
   if (meta.id === 'unknown' && !labelOverride) return null;
   const label = labelOverride || meta.label;
   return (
-    <Badge variant={variant} className={cn('gap-1.5', providerBadgeClass(meta.id), className)}>
-      <ProviderIcon provider={meta.id} size={12} />
+    <Badge variant={variant} className={cn('gap-1.5 font-medium', providerBadgeClass(meta.id), className)}>
+      <ProviderIcon provider={meta.id} size={13} />
       <span>{prefix ? `${prefix}: ${label}` : label}</span>
-      {external ? <ExternalLink className="w-3 h-3" /> : null}
+      {external ? <ExternalLink className="w-3 h-3 opacity-60" /> : null}
     </Badge>
   );
 }

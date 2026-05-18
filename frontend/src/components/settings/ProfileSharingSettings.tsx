@@ -8,6 +8,7 @@ import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
+import { PasswordInput } from '@/components/ui/password-input';
 import { Switch } from '@/components/ui/switch';
 
 function getInitials(username: string): string {
@@ -68,13 +69,17 @@ type Props = {
 };
 
 export function ProfileSharingSettings({ compact = false }: Props) {
-  const { user, refreshSession } = useAuth();
+  const { user, refreshSession, logout } = useAuth();
   const [acceptShares, setAcceptShares] = useState<boolean>(Boolean(user?.accept_shares ?? true));
   const [shareLikedPublic, setShareLikedPublic] = useState<boolean>(Boolean(user?.share_liked_public ?? false));
   const [shareRecommendationsPublic, setShareRecommendationsPublic] = useState<boolean>(Boolean(user?.share_recommendations_public ?? false));
   const [avatarDataUrl, setAvatarDataUrl] = useState<string | null>(user?.avatar_data_url ?? null);
   const [saving, setSaving] = useState(false);
   const [avatarBusy, setAvatarBusy] = useState(false);
+  const [passwordBusy, setPasswordBusy] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -109,6 +114,36 @@ export function ProfileSharingSettings({ compact = false }: Props) {
       toast.error(getApiErrorMessage(error));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const hasPasswordDraft = Boolean(currentPassword || newPassword || confirmPassword);
+
+  const changePassword = async () => {
+    if (!currentPassword || !newPassword || !confirmPassword) {
+      toast.error('Fill in current password, new password, and confirmation');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      toast.error('Passwords do not match');
+      return;
+    }
+    setPasswordBusy(true);
+    try {
+      await api.changeAuthPassword({
+        current_password: currentPassword,
+        new_password: newPassword,
+        new_password_confirm: confirmPassword,
+      });
+      setCurrentPassword('');
+      setNewPassword('');
+      setConfirmPassword('');
+      toast.success('Password changed. Please sign in again.');
+      await logout();
+    } catch (error) {
+      toast.error(getApiErrorMessage(error));
+    } finally {
+      setPasswordBusy(false);
     }
   };
 
@@ -232,6 +267,55 @@ export function ProfileSharingSettings({ compact = false }: Props) {
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
             Save profile
           </Button>
+        </div>
+
+        <div className="rounded-xl border border-border/60 bg-background/40 p-4 space-y-4">
+          <div className="space-y-1">
+            <Label className="text-sm font-medium">Change password</Label>
+            <p className="text-xs text-muted-foreground">
+              Confirm your current password, choose a new one, then sign in again with the updated credential.
+            </p>
+          </div>
+          <div className="grid gap-4 lg:grid-cols-3">
+            <div className="space-y-1">
+              <Label htmlFor="current-password">Current password</Label>
+              <PasswordInput
+                id="current-password"
+                value={currentPassword}
+                onChange={(event) => setCurrentPassword(event.target.value)}
+                autoComplete="current-password"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="new-password">New password</Label>
+              <PasswordInput
+                id="new-password"
+                value={newPassword}
+                onChange={(event) => setNewPassword(event.target.value)}
+                autoComplete="new-password"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="confirm-password">Confirm new password</Label>
+              <PasswordInput
+                id="confirm-password"
+                value={confirmPassword}
+                onChange={(event) => setConfirmPassword(event.target.value)}
+                autoComplete="new-password"
+              />
+            </div>
+          </div>
+          <div className="flex justify-end">
+            <Button
+              type="button"
+              onClick={() => void changePassword()}
+              disabled={!hasPasswordDraft || passwordBusy}
+              className="gap-2"
+            >
+              {passwordBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+              Update password
+            </Button>
+          </div>
         </div>
       </CardContent>
     </Card>

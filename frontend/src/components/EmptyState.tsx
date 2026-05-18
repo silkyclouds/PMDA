@@ -14,12 +14,13 @@ export function EmptyState({ onStartScan, isScanning }: EmptyStateProps) {
       </div>
       
       <h3 className="text-xl font-semibold text-foreground mb-2">
-        No Duplicates Found
+        {isScanning ? 'Duplicate review is still building' : 'No duplicate groups to review'}
       </h3>
       
       <p className="text-muted-foreground max-w-md mb-6">
-        Your library looks clean! Start a new scan to check for duplicate albums, 
-        or the scan is still in progress.
+        {isScanning
+          ? 'PMDA has not published reviewable duplicate groups for this scan yet. Keep the scan running; groups will appear here as soon as they are persisted.'
+          : 'No open duplicate groups are available. Start a new scan to check for duplicate albums.'}
       </p>
 
       <Button 
@@ -28,7 +29,7 @@ export function EmptyState({ onStartScan, isScanning }: EmptyStateProps) {
         className="gap-1.5"
       >
         <RefreshCw className="w-4 h-4" />
-        Start New Scan
+        {isScanning ? 'Scan running' : 'Start new scan'}
       </Button>
     </div>
   );

@@ -20,7 +20,6 @@ ENV PMDA_PG_HOST=127.0.0.1
 ENV PMDA_PG_PORT=5432
 ENV PMDA_PG_DB=pmda
 ENV PMDA_PG_USER=pmda
-ENV PMDA_PG_PASSWORD=pmda
 ENV PMDA_REDIS_HOST=127.0.0.1
 ENV PMDA_REDIS_PORT=6379
 ENV PMDA_REDIS_DB=0
@@ -30,6 +29,8 @@ RUN mkdir -p /etc/postgresql-common && \
     printf 'create_main_cluster = false\n' > /etc/postgresql-common/createcluster.conf && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
+      git \
+      curl \
       ffmpeg \
       nodejs \
       npm \
@@ -44,7 +45,29 @@ RUN mkdir -p /etc/postgresql-common && \
       postgresql \
       postgresql-contrib \
       redis-server \
+      docker.io \
+      docker-compose \
+      zstd \
     && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /usr/local/bin \
+    && curl -fsSL https://ollama.com/download/ollama-linux-amd64.tar.zst \
+      | zstd -d \
+      | tar -xOf - bin/ollama > /usr/local/bin/ollama \
+    && chmod +x /usr/local/bin/ollama
+
+RUN set -eux; \
+    case "${TARGETARCH}${TARGETVARIANT:+/${TARGETVARIANT}}" in \
+      amd64) docker_arch='x86_64' ;; \
+      arm64) docker_arch='aarch64' ;; \
+      arm/v7) docker_arch='armhf' ;; \
+      *) echo "Unsupported Docker CLI architecture: ${TARGETARCH}${TARGETVARIANT:+/${TARGETVARIANT}}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://download.docker.com/linux/static/stable/${docker_arch}/docker-26.1.4.tgz" \
+      | tar -xz -C /tmp docker/docker; \
+    mv /tmp/docker/docker /usr/local/bin/docker; \
+    chmod +x /usr/local/bin/docker; \
+    rm -rf /tmp/docker
 
 # arm/v7 lacks wheels for some Python deps (e.g. Pillow/cffi), so compile toolchain is needed.
 RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \

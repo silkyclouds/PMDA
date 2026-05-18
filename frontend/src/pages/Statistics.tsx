@@ -33,6 +33,7 @@ import { Bar, Line, Doughnut, Pie } from 'react-chartjs-2';
 import type {
   BenchmarkReportSummary,
   CacheControlMetrics,
+  EnrichmentSourcesResponse,
   ScanAICostSummary,
   ScanHistoryEntry,
   ScanProgress,
@@ -72,6 +73,7 @@ const AI_COST_SCAN_ROWS_LIMIT = 30;
 
 type PeriodKey = (typeof PERIODS)[number]['key'];
 type StatsTab = 'overview' | 'metadata' | 'quality' | 'operations' | 'duplicates' | 'incompletes' | 'pipeline' | 'ai' | 'benchmark';
+type ProviderCountMap = Record<string, number>;
 
 interface ScanSnapshot {
   scanId: number;
@@ -88,6 +90,15 @@ interface ScanSnapshot {
   discogsMatches: number;
   lastfmMatches: number;
   bandcampMatches: number;
+  strictProviderCounts: ProviderCountMap;
+  musicbrainzIdentityHits: number;
+  musicbrainzIdentityVerified: number;
+  musicbrainzStrictWins: number;
+  musicbrainzIdentityNonWins: number;
+  musicbrainzIdsCaptured: number;
+  musicbrainzOutcomeCounts: ProviderCountMap;
+  musicbrainzNonWinByWinner: ProviderCountMap;
+  musicbrainzNonWinByReason: ProviderCountMap;
   withTags: number;
   withCover: number;
   withArtistImage: number;
@@ -109,6 +120,9 @@ interface ScanSnapshot {
   aiTokensTotal: number;
   aiCostUsdTotal: number;
   aiUnpricedCalls: number;
+  providerNoTracklistTotal: number;
+  providerNoTracklistByProvider: Record<string, number>;
+  providerNoTracklistByCause: Record<string, number>;
 }
 
 interface AggregateStats {
@@ -124,6 +138,15 @@ interface AggregateStats {
   discogsMatches: number;
   lastfmMatches: number;
   bandcampMatches: number;
+  strictProviderCounts: ProviderCountMap;
+  musicbrainzIdentityHits: number;
+  musicbrainzIdentityVerified: number;
+  musicbrainzStrictWins: number;
+  musicbrainzIdentityNonWins: number;
+  musicbrainzIdsCaptured: number;
+  musicbrainzOutcomeCounts: ProviderCountMap;
+  musicbrainzNonWinByWinner: ProviderCountMap;
+  musicbrainzNonWinByReason: ProviderCountMap;
   withTags: number;
   withCover: number;
   withArtistImage: number;
@@ -145,6 +168,9 @@ interface AggregateStats {
   aiTokensTotal: number;
   aiCostUsdTotal: number;
   aiUnpricedCalls: number;
+  providerNoTracklistTotal: number;
+  providerNoTracklistByProvider: Record<string, number>;
+  providerNoTracklistByCause: Record<string, number>;
 }
 
 function n(value: number | null | undefined): number {
@@ -180,6 +206,16 @@ function formatPercent(value: number, total: number): string {
   return `${((value / total) * 100).toFixed(1)}%`;
 }
 
+function mergeCountMaps(left: Record<string, number>, right: Record<string, number>): Record<string, number> {
+  const out: Record<string, number> = { ...left };
+  for (const [key, value] of Object.entries(right || {})) {
+    const safeKey = String(key || '').trim();
+    if (!safeKey) continue;
+    out[safeKey] = Number(out[safeKey] || 0) + Number(value || 0);
+  }
+  return out;
+}
+
 function formatDuration(seconds: number): string {
   if (seconds <= 0) return '0s';
   const h = Math.floor(seconds / 3600);
@@ -188,6 +224,99 @@ function formatDuration(seconds: number): string {
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
+}
+
+function normalizeProviderCountMap(value: unknown): ProviderCountMap {
+  const out: ProviderCountMap = {};
+  if (!value || typeof value !== 'object') return out;
+  for (const [rawKey, rawValue] of Object.entries(value as Record<string, unknown>)) {
+    const key = String(rawKey || '').trim().toLowerCase() || 'unknown';
+    const count = Number(rawValue || 0);
+    if (count > 0) {
+      out[key] = Math.max(0, Math.round(count));
+    }
+  }
+  return out;
+}
+
+function legacyStrictProviderCounts(
+  strictMatchedAlbums: number,
+  discogsMatches: number,
+  lastfmMatches: number,
+  bandcampMatches: number,
+): ProviderCountMap {
+  const out: ProviderCountMap = {};
+  if (discogsMatches > 0) out.discogs = discogsMatches;
+  if (lastfmMatches > 0) out.lastfm = lastfmMatches;
+  if (bandcampMatches > 0) out.bandcamp = bandcampMatches;
+  const attributed = discogsMatches + lastfmMatches + bandcampMatches;
+  const legacyUnattributed = Math.max(0, strictMatchedAlbums - attributed);
+  if (legacyUnattributed > 0) {
+    out.legacy_unattributed = legacyUnattributed;
+  }
+  return out;
+}
+
+function providerDisplayLabel(provider: string): string {
+  const key = String(provider || '').trim().toLowerCase();
+  if (key === 'musicbrainz') return 'MusicBrainz';
+  if (key === 'lastfm') return 'Last.fm';
+  if (key === 'bandcamp') return 'Bandcamp';
+  if (key === 'discogs') return 'Discogs';
+  if (key === 'legacy_unattributed') return 'Legacy unattributed';
+  if (key === 'unknown') return 'Unknown';
+  return key.charAt(0).toUpperCase() + key.slice(1);
+}
+
+function providerChartColor(provider: string): { bg: string; border: string } {
+  const key = String(provider || '').trim().toLowerCase();
+  const palette: Record<string, { bg: string; border: string }> = {
+    musicbrainz: { bg: 'rgba(59,130,246,0.85)', border: '#2563eb' },
+    discogs: { bg: 'rgba(34,197,94,0.85)', border: '#16a34a' },
+    lastfm: { bg: 'rgba(249,115,22,0.85)', border: '#ea580c' },
+    bandcamp: { bg: 'rgba(168,85,247,0.85)', border: '#9333ea' },
+    legacy_unattributed: { bg: 'rgba(148,163,184,0.85)', border: '#64748b' },
+    unknown: { bg: 'rgba(100,116,139,0.85)', border: '#475569' },
+  };
+  return palette[key] || { bg: 'rgba(15,118,110,0.85)', border: '#0f766e' };
+}
+
+function musicbrainzOutcomeLabel(key: string): string {
+  const norm = String(key || '').trim().toLowerCase();
+  const labels: Record<string, string> = {
+    strict_win: 'MB strict win',
+    id_captured_other_provider_won: 'ID captured, other provider won',
+    id_captured_tracklist_reject: 'ID captured, tracklist reject',
+    id_captured_identity_reject: 'ID captured, identity reject',
+    id_captured_no_strict_match: 'ID captured, no strict match',
+    no_mb_signal_other_provider_won: 'No MB signal, other provider won',
+    no_mb_signal_no_match: 'No MB signal, no match',
+  };
+  return labels[norm] || providerDisplayLabel(norm);
+}
+
+function musicbrainzReasonLabel(key: string): string {
+  const norm = String(key || '').trim().toLowerCase();
+  const labels: Record<string, string> = {
+    provider_no_tracklist: 'No usable MB tracklist',
+    track_count_mismatch: 'Track count mismatch',
+    track_title_mismatch: 'Track title mismatch',
+    artist_mismatch: 'Artist mismatch',
+    album_mismatch: 'Album title mismatch',
+    provider_id_missing: 'Provider ID missing',
+    provider_id_mismatch: 'Provider ID mismatch',
+    strict_reject: 'Generic strict reject',
+    classical_work_mismatch: 'Classical work mismatch',
+    classical_composer_mismatch: 'Composer mismatch',
+    classical_performance_mismatch: 'Performance mismatch',
+    classical_track_count_mismatch: 'Classical track count mismatch',
+    classical_disc_count_mismatch: 'Classical disc count mismatch',
+    classical_duration_mismatch: 'Classical duration mismatch',
+    classical_label_plus_performance_mismatch: 'Label/performance mismatch',
+    classical_year_mismatch: 'Year mismatch',
+    classical_context_insufficient: 'Context insufficient',
+  };
+  return labels[norm] || providerDisplayLabel(norm);
 }
 
 const chartOptions = {
@@ -204,17 +333,31 @@ function normalizeScan(entry: ScanHistoryEntry): ScanSnapshot {
   const withoutTags = n(summary?.albums_without_complete_tags ?? entry.albums_without_complete_tags);
   const withoutCover = n(summary?.albums_without_album_image ?? entry.albums_without_album_image);
   const withoutArtistImage = n(summary?.albums_without_artist_image ?? entry.albums_without_artist_image);
-  const albumsWithMbId = n(
+  const strictMatchedAlbums = n(
     summary?.strict_matched_albums
       ?? summary?.albums_with_mb_id
       ?? Math.max(0, albumsScanned - n(summary?.albums_without_mb_id ?? entry.albums_without_mb_id)),
   );
-
-  const discogsMatches = n(summary?.scan_discogs_matched);
-  const lastfmMatches = n(summary?.scan_lastfm_matched);
-  const bandcampMatches = n(summary?.scan_bandcamp_matched);
-
-  const matchedAlbums = Math.min(albumsScanned, Math.max(0, albumsWithMbId));
+  const matchedAlbums = Math.min(albumsScanned, Math.max(0, strictMatchedAlbums));
+  const albumsWithMbId = matchedAlbums;
+  const discogsMatches = n(summary?.scan_discogs_matched ?? summary?.strict_provider_counts?.discogs);
+  const lastfmMatches = n(summary?.scan_lastfm_matched ?? summary?.strict_provider_counts?.lastfm);
+  const bandcampMatches = n(summary?.scan_bandcamp_matched ?? summary?.strict_provider_counts?.bandcamp);
+  const explicitStrictProviderCounts = normalizeProviderCountMap(summary?.strict_provider_counts);
+  const strictProviderCounts = Object.keys(explicitStrictProviderCounts).length > 0
+    ? explicitStrictProviderCounts
+    : legacyStrictProviderCounts(matchedAlbums, discogsMatches, lastfmMatches, bandcampMatches);
+  const musicbrainzOutcomeCounts = normalizeProviderCountMap(summary?.musicbrainz_outcome_counts);
+  const musicbrainzNonWinByWinner = normalizeProviderCountMap(summary?.musicbrainz_non_win_by_winner);
+  const musicbrainzNonWinByReason = normalizeProviderCountMap(summary?.musicbrainz_non_win_by_reason);
+  const musicbrainzStrictWins = n(summary?.musicbrainz_strict_wins ?? strictProviderCounts.musicbrainz);
+  const musicbrainzIdentityHits = n(summary?.musicbrainz_identity_hits);
+  const musicbrainzIdentityVerified = n(summary?.musicbrainz_identity_verified);
+  const musicbrainzIdentityNonWins = n(
+    summary?.musicbrainz_identity_non_wins
+      ?? Math.max(0, musicbrainzIdentityVerified - musicbrainzStrictWins),
+  );
+  const musicbrainzIdsCaptured = n(summary?.musicbrainz_ids_captured ?? musicbrainzIdentityHits);
 
   return {
     scanId: entry.scan_id,
@@ -231,6 +374,15 @@ function normalizeScan(entry: ScanHistoryEntry): ScanSnapshot {
     discogsMatches,
     lastfmMatches,
     bandcampMatches,
+    strictProviderCounts,
+    musicbrainzIdentityHits,
+    musicbrainzIdentityVerified,
+    musicbrainzStrictWins,
+    musicbrainzIdentityNonWins,
+    musicbrainzIdsCaptured,
+    musicbrainzOutcomeCounts,
+    musicbrainzNonWinByWinner,
+    musicbrainzNonWinByReason,
     withTags: Math.max(0, albumsScanned - withoutTags),
     withCover: Math.max(0, albumsScanned - withoutCover),
     withArtistImage: Math.max(0, albumsScanned - withoutArtistImage),
@@ -252,6 +404,9 @@ function normalizeScan(entry: ScanHistoryEntry): ScanSnapshot {
     aiTokensTotal: n(summary?.ai_tokens_total ?? entry.ai_tokens_total),
     aiCostUsdTotal: n(summary?.ai_cost_usd_total ?? entry.ai_cost_usd_total),
     aiUnpricedCalls: n(summary?.ai_unpriced_calls ?? entry.ai_unpriced_calls),
+    providerNoTracklistTotal: n(summary?.provider_no_tracklist_total ?? summary?.provider_no_tracklist?.total),
+    providerNoTracklistByProvider: { ...(summary?.provider_no_tracklist_by_provider || summary?.provider_no_tracklist?.by_provider || {}) },
+    providerNoTracklistByCause: { ...(summary?.provider_no_tracklist_by_cause || summary?.provider_no_tracklist?.by_cause || {}) },
   };
 }
 
@@ -272,11 +427,8 @@ function normalizeLiveScan(progress: ScanProgress, fallbackStartTime: number): S
   const withoutTags = n(progress.albums_without_complete_tags);
   const withoutCover = n(progress.albums_without_album_image);
   const withoutArtistImage = n(progress.albums_without_artist_image);
-  const albumsWithMbId = Math.max(0, totalAlbums - n(progress.albums_without_mb_id));
-  const discogsMatches = n(progress.scan_discogs_matched);
-  const lastfmMatches = n(progress.scan_lastfm_matched);
-  const bandcampMatches = n(progress.scan_bandcamp_matched);
-  const matchedAlbums = Math.min(totalAlbums, Math.max(0, albumsWithMbId));
+  const matchedAlbums = Math.min(totalAlbums, Math.max(0, totalAlbums - n(progress.albums_without_mb_id)));
+  const albumsWithMbId = matchedAlbums;
   const startTime = n(progress.scan_start_time ?? fallbackStartTime);
   const now = Math.floor(Date.now() / 1000);
   const durationSeconds = startTime > 0 ? Math.max(0, now - startTime) : 0;
@@ -293,9 +445,18 @@ function normalizeLiveScan(progress: ScanProgress, fallbackStartTime: number): S
     matchedAlbums: Math.min(processedAlbums, matchedAlbums),
     albumsWithMbId,
     mbVerifiedByAi: 0,
-    discogsMatches,
-    lastfmMatches,
-    bandcampMatches,
+    discogsMatches: 0,
+    lastfmMatches: 0,
+    bandcampMatches: 0,
+    strictProviderCounts: {},
+    musicbrainzIdentityHits: 0,
+    musicbrainzIdentityVerified: 0,
+    musicbrainzStrictWins: 0,
+    musicbrainzIdentityNonWins: 0,
+    musicbrainzIdsCaptured: 0,
+    musicbrainzOutcomeCounts: {},
+    musicbrainzNonWinByWinner: {},
+    musicbrainzNonWinByReason: {},
     withTags: Math.max(0, processedAlbums - withoutTags),
     withCover: Math.max(0, processedAlbums - withoutCover),
     withArtistImage: Math.max(0, processedAlbums - withoutArtistImage),
@@ -317,6 +478,9 @@ function normalizeLiveScan(progress: ScanProgress, fallbackStartTime: number): S
     aiTokensTotal: 0,
     aiCostUsdTotal: 0,
     aiUnpricedCalls: 0,
+    providerNoTracklistTotal: 0,
+    providerNoTracklistByProvider: {},
+    providerNoTracklistByCause: {},
   };
 }
 
@@ -335,6 +499,15 @@ function aggregate(scans: ScanSnapshot[]): AggregateStats {
       acc.discogsMatches += scan.discogsMatches;
       acc.lastfmMatches += scan.lastfmMatches;
       acc.bandcampMatches += scan.bandcampMatches;
+      acc.strictProviderCounts = mergeCountMaps(acc.strictProviderCounts, scan.strictProviderCounts);
+      acc.musicbrainzIdentityHits += scan.musicbrainzIdentityHits;
+      acc.musicbrainzIdentityVerified += scan.musicbrainzIdentityVerified;
+      acc.musicbrainzStrictWins += scan.musicbrainzStrictWins;
+      acc.musicbrainzIdentityNonWins += scan.musicbrainzIdentityNonWins;
+      acc.musicbrainzIdsCaptured += scan.musicbrainzIdsCaptured;
+      acc.musicbrainzOutcomeCounts = mergeCountMaps(acc.musicbrainzOutcomeCounts, scan.musicbrainzOutcomeCounts);
+      acc.musicbrainzNonWinByWinner = mergeCountMaps(acc.musicbrainzNonWinByWinner, scan.musicbrainzNonWinByWinner);
+      acc.musicbrainzNonWinByReason = mergeCountMaps(acc.musicbrainzNonWinByReason, scan.musicbrainzNonWinByReason);
       acc.withTags += scan.withTags;
       acc.withCover += scan.withCover;
       acc.withArtistImage += scan.withArtistImage;
@@ -356,6 +529,9 @@ function aggregate(scans: ScanSnapshot[]): AggregateStats {
       acc.aiTokensTotal += scan.aiTokensTotal;
       acc.aiCostUsdTotal += scan.aiCostUsdTotal;
       acc.aiUnpricedCalls += scan.aiUnpricedCalls;
+      acc.providerNoTracklistTotal += scan.providerNoTracklistTotal;
+      acc.providerNoTracklistByProvider = mergeCountMaps(acc.providerNoTracklistByProvider, scan.providerNoTracklistByProvider);
+      acc.providerNoTracklistByCause = mergeCountMaps(acc.providerNoTracklistByCause, scan.providerNoTracklistByCause);
       return acc;
     },
     {
@@ -371,6 +547,15 @@ function aggregate(scans: ScanSnapshot[]): AggregateStats {
       discogsMatches: 0,
       lastfmMatches: 0,
       bandcampMatches: 0,
+      strictProviderCounts: {},
+      musicbrainzIdentityHits: 0,
+      musicbrainzIdentityVerified: 0,
+      musicbrainzStrictWins: 0,
+      musicbrainzIdentityNonWins: 0,
+      musicbrainzIdsCaptured: 0,
+      musicbrainzOutcomeCounts: {},
+      musicbrainzNonWinByWinner: {},
+      musicbrainzNonWinByReason: {},
       withTags: 0,
       withCover: 0,
       withArtistImage: 0,
@@ -392,6 +577,9 @@ function aggregate(scans: ScanSnapshot[]): AggregateStats {
       aiTokensTotal: 0,
       aiCostUsdTotal: 0,
       aiUnpricedCalls: 0,
+      providerNoTracklistTotal: 0,
+      providerNoTracklistByProvider: {},
+      providerNoTracklistByCause: {},
     },
   );
 }
@@ -414,7 +602,7 @@ function DeltaPill({
   const good = diff > 0 ? positiveIsGood : !positiveIsGood;
   const sign = diff > 0 ? '+' : '';
   return (
-    <span className={good ? 'text-xs text-emerald-600' : 'text-xs text-red-500'}>
+    <span className={good ? 'text-xs text-success' : 'text-xs text-destructive'}>
       vs prev: {sign}{diff.toFixed(Math.abs(diff) < 10 ? 1 : 0)}{suffix}
     </span>
   );
@@ -498,6 +686,12 @@ export default function Statistics() {
   } = useQuery({
     queryKey: ['library-stats-library'],
     queryFn: api.getLibraryStatsLibrary,
+    refetchInterval: (scanProgress?.scanning || scanProgress?.post_processing) ? 5000 : 30000,
+    refetchIntervalInBackground: true,
+  });
+  const { data: enrichmentSources } = useQuery<EnrichmentSourcesResponse>({
+    queryKey: ['stats-enrichment-sources'],
+    queryFn: api.getEnrichmentSources,
     refetchInterval: (scanProgress?.scanning || scanProgress?.post_processing) ? 5000 : 30000,
     refetchIntervalInBackground: true,
   });
@@ -613,10 +807,19 @@ export default function Statistics() {
     refetchInterval: (scanProgress?.scanning || scanProgress?.post_processing) ? 5000 : 30000,
     refetchIntervalInBackground: true,
   });
+  const {
+    data: aiOverview,
+  } = useQuery({
+    queryKey: ['ai-overview'],
+    queryFn: () => api.getAIOverview(),
+    refetchInterval: (scanProgress?.scanning || scanProgress?.post_processing) ? 10000 : 30000,
+    refetchIntervalInBackground: true,
+  });
   const benchmarkReports = useMemo<BenchmarkReportSummary[]>(
     () => benchmarkReportsResponse?.reports ?? [],
     [benchmarkReportsResponse?.reports],
   );
+  const aiOverviewDomains = useMemo(() => aiOverview?.domains ?? [], [aiOverview?.domains]);
   const latestBenchmark = benchmarkReports[0] ?? null;
   const benchmarkAverageScore = useMemo(() => {
     if (benchmarkReports.length <= 0) return 0;
@@ -881,62 +1084,177 @@ export default function Statistics() {
     };
   }, [scansChrono]);
 
-  const metadataProvidersData = useMemo(() => {
-    const mbProviderMatches = Math.max(
-      0,
-      current.albumsWithMbId - current.discogsMatches - current.lastfmMatches - current.bandcampMatches,
-    );
-    return {
-      labels: ['MusicBrainz', 'Discogs', 'Last.fm', 'Bandcamp'],
-      datasets: [
-        {
-          data: [
-            mbProviderMatches,
-            current.discogsMatches,
-            current.lastfmMatches,
-            current.bandcampMatches,
-          ],
-          backgroundColor: [
-            'rgba(59,130,246,0.85)',
-            'rgba(34,197,94,0.85)',
-            'rgba(249,115,22,0.85)',
-            'rgba(168,85,247,0.85)',
-          ],
-          borderColor: ['#2563eb', '#16a34a', '#ea580c', '#9333ea'],
-          borderWidth: 1,
-        },
-      ],
-    };
-  }, [current.albumsWithMbId, current.discogsMatches, current.lastfmMatches, current.bandcampMatches]);
+  const strictWinnerProviderEntries = useMemo(
+    () => Object.entries(current.strictProviderCounts || {})
+      .filter(([, count]) => Number(count || 0) > 0)
+      .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0)),
+    [current.strictProviderCounts],
+  );
 
-  const metadataProvidersBarData = useMemo(() => {
-    const mbProviderMatches = Math.max(
-      0,
-      current.albumsWithMbId - current.discogsMatches - current.lastfmMatches - current.bandcampMatches,
-    );
+  const musicbrainzOutcomeEntries = useMemo(
+    () => Object.entries(current.musicbrainzOutcomeCounts || {})
+      .filter(([, count]) => Number(count || 0) > 0)
+      .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0)),
+    [current.musicbrainzOutcomeCounts],
+  );
+
+  const musicbrainzNonWinWinnerEntries = useMemo(
+    () => Object.entries(current.musicbrainzNonWinByWinner || {})
+      .filter(([, count]) => Number(count || 0) > 0)
+      .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0)),
+    [current.musicbrainzNonWinByWinner],
+  );
+
+  const musicbrainzNonWinReasonEntries = useMemo(
+    () => Object.entries(current.musicbrainzNonWinByReason || {})
+      .filter(([, count]) => Number(count || 0) > 0)
+      .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
+      .slice(0, 8),
+    [current.musicbrainzNonWinByReason],
+  );
+
+  const strictWinnerProviderData = useMemo(() => {
+    const colors = strictWinnerProviderEntries.map(([provider]) => providerChartColor(provider));
     return {
-      labels: ['MusicBrainz', 'Discogs', 'Last.fm', 'Bandcamp'],
+      labels: strictWinnerProviderEntries.map(([provider]) => providerDisplayLabel(provider)),
       datasets: [
         {
-          label: 'Matched albums',
-          data: [
-            mbProviderMatches,
-            current.discogsMatches,
-            current.lastfmMatches,
-            current.bandcampMatches,
-          ],
-          backgroundColor: [
-            'rgba(59,130,246,0.85)',
-            'rgba(34,197,94,0.85)',
-            'rgba(249,115,22,0.85)',
-            'rgba(168,85,247,0.85)',
-          ],
-          borderColor: ['#2563eb', '#16a34a', '#ea580c', '#9333ea'],
+          label: 'Strict winner albums',
+          data: strictWinnerProviderEntries.map(([, count]) => Number(count || 0)),
+          backgroundColor: colors.map((entry) => entry.bg),
+          borderColor: colors.map((entry) => entry.border),
           borderWidth: 1,
         },
       ],
     };
-  }, [current.albumsWithMbId, current.discogsMatches, current.lastfmMatches, current.bandcampMatches]);
+  }, [strictWinnerProviderEntries]);
+
+  const musicbrainzParticipationData = useMemo(() => {
+    return {
+      labels: ['MB IDs captured', 'Verified with MB', 'MB strict wins', 'MB assisted non-wins'],
+      datasets: [
+        {
+          label: 'Albums',
+          data: [
+            current.musicbrainzIdsCaptured,
+            current.musicbrainzIdentityVerified,
+            current.musicbrainzStrictWins,
+            current.musicbrainzIdentityNonWins,
+          ],
+          backgroundColor: [
+            'rgba(59,130,246,0.85)',
+            'rgba(14,165,233,0.85)',
+            'rgba(34,197,94,0.85)',
+            'rgba(249,115,22,0.85)',
+          ],
+          borderColor: ['#2563eb', '#0284c7', '#16a34a', '#ea580c'],
+          borderWidth: 1,
+        },
+      ],
+    };
+  }, [
+    current.musicbrainzIdsCaptured,
+    current.musicbrainzIdentityNonWins,
+    current.musicbrainzIdentityVerified,
+    current.musicbrainzStrictWins,
+  ]);
+
+  const hasMusicbrainzParticipation = current.musicbrainzIdsCaptured > 0
+    || current.musicbrainzIdentityVerified > 0
+    || current.musicbrainzStrictWins > 0
+    || current.musicbrainzIdentityNonWins > 0;
+
+  const musicbrainzOutcomeData = useMemo(() => {
+    const colors = musicbrainzOutcomeEntries.map(([provider]) => providerChartColor(provider));
+    return {
+      labels: musicbrainzOutcomeEntries.map(([key]) => musicbrainzOutcomeLabel(key)),
+      datasets: [
+        {
+          label: 'Albums',
+          data: musicbrainzOutcomeEntries.map(([, count]) => Number(count || 0)),
+          backgroundColor: colors.map((entry) => entry.bg),
+          borderColor: colors.map((entry) => entry.border),
+          borderWidth: 1,
+        },
+      ],
+    };
+  }, [musicbrainzOutcomeEntries]);
+
+  const providerNoTracklistCauseLabels = useMemo<Record<string, string>>(
+    () => ({
+      api_or_parser: 'API / parser',
+      edition: 'Edition mismatch',
+      absence_real: 'No usable tracklist',
+    }),
+    [],
+  );
+
+  const providerNoTracklistByCauseEntries = useMemo(
+    () => Object.entries(current.providerNoTracklistByCause || {}).sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0)),
+    [current.providerNoTracklistByCause],
+  );
+
+  const providerNoTracklistByProviderEntries = useMemo(
+    () => Object.entries(current.providerNoTracklistByProvider || {}).sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0)),
+    [current.providerNoTracklistByProvider],
+  );
+
+  const enrichmentProviderLabels = useMemo(() => {
+    const providers = Object.entries(enrichmentSources?.overall?.providers || {})
+      .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
+      .map(([provider]) => provider);
+    return providers.length > 0 ? providers : ['bandcamp', 'discogs', 'lastfm', 'musicbrainz'];
+  }, [enrichmentSources]);
+
+  const enrichmentProviderColors = useMemo(() => {
+    const palette: Record<string, { bg: string; border: string }> = {
+      bandcamp: { bg: 'rgba(168,85,247,0.85)', border: '#9333ea' },
+      discogs: { bg: 'rgba(34,197,94,0.85)', border: '#16a34a' },
+      lastfm: { bg: 'rgba(249,115,22,0.85)', border: '#ea580c' },
+      musicbrainz: { bg: 'rgba(59,130,246,0.85)', border: '#2563eb' },
+      wikipedia: { bg: 'rgba(107,114,128,0.85)', border: '#4b5563' },
+      fanart: { bg: 'rgba(236,72,153,0.85)', border: '#db2777' },
+      audiodb: { bg: 'rgba(6,182,212,0.85)', border: '#0891b2' },
+      unknown: { bg: 'rgba(148,163,184,0.85)', border: '#64748b' },
+    };
+    return enrichmentProviderLabels.map((provider) => palette[provider] || { bg: 'rgba(148,163,184,0.85)', border: '#64748b' });
+  }, [enrichmentProviderLabels]);
+
+  const enrichmentOverallData = useMemo(() => {
+    const providerMap = enrichmentSources?.overall?.providers || {};
+    return {
+      labels: enrichmentProviderLabels,
+      datasets: [
+        {
+          data: enrichmentProviderLabels.map((provider) => Number(providerMap[provider] || 0)),
+          backgroundColor: enrichmentProviderColors.map((c) => c.bg),
+          borderColor: enrichmentProviderColors.map((c) => c.border),
+          borderWidth: 1,
+        },
+      ],
+    };
+  }, [enrichmentProviderColors, enrichmentProviderLabels, enrichmentSources]);
+
+  const enrichmentBreakdownData = useMemo(() => {
+    const rows = [
+      ['Album profiles', enrichmentSources?.album_profiles?.providers || {}],
+      ['Artist profiles', enrichmentSources?.artist_profiles?.providers || {}],
+      ['Artist images', enrichmentSources?.artist_images?.providers || {}],
+      ['Label logos', enrichmentSources?.label_logos?.providers || {}],
+    ];
+    return {
+      labels: rows.map(([label]) => label),
+      datasets: enrichmentProviderLabels.map((provider, idx) => ({
+        label: provider,
+        data: rows.map(([, providerMap]) => Number((providerMap as Record<string, number>)[provider] || 0)),
+        backgroundColor: enrichmentProviderColors[idx]?.bg || 'rgba(148,163,184,0.85)',
+        borderColor: enrichmentProviderColors[idx]?.border || '#64748b',
+        borderWidth: 1,
+      })),
+    };
+  }, [enrichmentProviderColors, enrichmentProviderLabels, enrichmentSources]);
+
+  const enrichmentOverallTotal = Number(enrichmentSources?.overall?.total || 0);
 
   const aiCallsBreakdownData = useMemo(() => {
     return {
@@ -1496,7 +1814,7 @@ export default function Statistics() {
               <TabsList className="grid h-auto w-full grid-cols-1 gap-2 rounded-xl border border-border bg-muted/30 p-2 shadow-sm sm:grid-cols-2 xl:grid-cols-3">
                 <TabsTrigger
                   value="overview"
-                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-cyan-400/60 data-[state=active]:bg-cyan-500/20 data-[state=active]:text-cyan-100 data-[state=active]:shadow-[0_0_0_1px_rgba(34,211,238,0.22)]"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-primary/60 data-[state=active]:bg-primary/15 data-[state=active]:text-foreground data-[state=active]:shadow-[0_0_0_1px_hsl(var(--primary)/0.22)]"
                 >
                   <span className="flex items-center gap-2">
                     <BarChart3 className="w-4 h-4" />
@@ -1505,7 +1823,7 @@ export default function Statistics() {
                 </TabsTrigger>
                 <TabsTrigger
                   value="metadata"
-                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-indigo-400/60 data-[state=active]:bg-indigo-500/20 data-[state=active]:text-indigo-100 data-[state=active]:shadow-[0_0_0_1px_rgba(129,140,248,0.22)]"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-primary/60 data-[state=active]:bg-primary/15 data-[state=active]:text-foreground data-[state=active]:shadow-[0_0_0_1px_hsl(var(--primary)/0.22)]"
                 >
                   <span className="flex items-center gap-2">
                     <Database className="w-4 h-4" />
@@ -1514,7 +1832,7 @@ export default function Statistics() {
                 </TabsTrigger>
                 <TabsTrigger
                   value="ai"
-                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-violet-400/60 data-[state=active]:bg-violet-500/20 data-[state=active]:text-violet-100 data-[state=active]:shadow-[0_0_0_1px_rgba(167,139,250,0.22)]"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-primary/60 data-[state=active]:bg-primary/15 data-[state=active]:text-foreground data-[state=active]:shadow-[0_0_0_1px_hsl(var(--primary)/0.22)]"
                 >
                   <span className="flex items-center gap-2">
                     <Sparkles className="w-4 h-4" />
@@ -1523,7 +1841,7 @@ export default function Statistics() {
                 </TabsTrigger>
                 <TabsTrigger
                   value="quality"
-                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-emerald-400/60 data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-100 data-[state=active]:shadow-[0_0_0_1px_rgba(52,211,153,0.22)]"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-primary/60 data-[state=active]:bg-primary/15 data-[state=active]:text-foreground data-[state=active]:shadow-[0_0_0_1px_hsl(var(--primary)/0.22)]"
                 >
                   <span className="flex items-center gap-2">
                     <Sparkles className="w-4 h-4" />
@@ -1532,7 +1850,7 @@ export default function Statistics() {
                 </TabsTrigger>
                 <TabsTrigger
                   value="operations"
-                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-amber-400/60 data-[state=active]:bg-amber-500/20 data-[state=active]:text-amber-100 data-[state=active]:shadow-[0_0_0_1px_rgba(251,191,36,0.22)]"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-primary/60 data-[state=active]:bg-primary/15 data-[state=active]:text-foreground data-[state=active]:shadow-[0_0_0_1px_hsl(var(--primary)/0.22)]"
                 >
                   <span className="flex items-center gap-2">
                     <Gauge className="w-4 h-4" />
@@ -1541,7 +1859,7 @@ export default function Statistics() {
                 </TabsTrigger>
                 <TabsTrigger
                   value="duplicates"
-                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-rose-400/60 data-[state=active]:bg-rose-500/20 data-[state=active]:text-rose-100 data-[state=active]:shadow-[0_0_0_1px_rgba(251,113,133,0.22)]"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-primary/60 data-[state=active]:bg-primary/15 data-[state=active]:text-foreground data-[state=active]:shadow-[0_0_0_1px_hsl(var(--primary)/0.22)]"
                 >
                   <span className="flex items-center gap-2">
                     <Layers className="w-4 h-4" />
@@ -1550,7 +1868,7 @@ export default function Statistics() {
                 </TabsTrigger>
                 <TabsTrigger
                   value="incompletes"
-                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-orange-400/60 data-[state=active]:bg-orange-500/20 data-[state=active]:text-orange-100 data-[state=active]:shadow-[0_0_0_1px_rgba(251,146,60,0.22)]"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-primary/60 data-[state=active]:bg-primary/15 data-[state=active]:text-foreground data-[state=active]:shadow-[0_0_0_1px_hsl(var(--primary)/0.22)]"
                 >
                   <span className="flex items-center gap-2">
                     <AlertCircle className="w-4 h-4" />
@@ -1560,7 +1878,7 @@ export default function Statistics() {
                 {isAdmin ? (
                   <TabsTrigger
                     value="pipeline"
-                    className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-sky-400/60 data-[state=active]:bg-sky-500/20 data-[state=active]:text-sky-100 data-[state=active]:shadow-[0_0_0_1px_rgba(56,189,248,0.22)]"
+                    className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-primary/60 data-[state=active]:bg-primary/15 data-[state=active]:text-foreground data-[state=active]:shadow-[0_0_0_1px_hsl(var(--primary)/0.22)]"
                   >
                     <span className="flex items-center gap-2">
                       <Server className="w-4 h-4" />
@@ -1570,7 +1888,7 @@ export default function Statistics() {
                 ) : null}
                 <TabsTrigger
                   value="benchmark"
-                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-pink-400/60 data-[state=active]:bg-pink-500/20 data-[state=active]:text-pink-100 data-[state=active]:shadow-[0_0_0_1px_rgba(244,114,182,0.22)]"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-primary/60 data-[state=active]:bg-primary/15 data-[state=active]:text-foreground data-[state=active]:shadow-[0_0_0_1px_hsl(var(--primary)/0.22)]"
                 >
                   <span className="flex items-center gap-2">
                     <Gauge className="w-4 h-4" />
@@ -1616,7 +1934,7 @@ export default function Statistics() {
                 />
                 <StatCard
                   title="Fully Complete"
-                  icon={<Sparkles className="w-4 h-4 text-emerald-500" />}
+                  icon={<Sparkles className="w-4 h-4 text-success" />}
                   value={`${current.fullyComplete.toLocaleString()} / ${current.albumsScanned.toLocaleString()}`}
                   description={`${formatPercent(current.fullyComplete, current.albumsScanned)} tags + cover + artist image`}
                   delta={<DeltaPill current={current.fullyComplete} previous={previous.fullyComplete} />}
@@ -1705,9 +2023,9 @@ export default function Statistics() {
                 <StatCard
                   title="Strict Coverage"
                   icon={<Database className="w-4 h-4 text-primary" />}
-                  value={`${current.albumsWithMbId.toLocaleString()} / ${current.albumsScanned.toLocaleString()}`}
-                  description={formatPercent(current.albumsWithMbId, current.albumsScanned)}
-                  delta={<DeltaPill current={current.albumsWithMbId} previous={previous.albumsWithMbId} />}
+                  value={`${current.matchedAlbums.toLocaleString()} / ${current.albumsScanned.toLocaleString()}`}
+                  description={`${formatPercent(current.matchedAlbums, current.albumsScanned)} strict winners`}
+                  delta={<DeltaPill current={current.matchedAlbums} previous={previous.matchedAlbums} />}
                 />
                 <StatCard
                   title="AI-Assisted MB"
@@ -1720,61 +2038,362 @@ export default function Statistics() {
                   <CardHeader className="pb-2">
                     <CardTitle className="text-xs font-medium flex items-center gap-1.5 text-muted-foreground uppercase tracking-wider">
                       <Database className="w-4 h-4 text-secondary" />
-                      Fallback Providers
+                      MusicBrainz Role
                     </CardTitle>
                   </CardHeader>
                   <CardContent className="space-y-2 text-sm">
                     <div className="flex items-center justify-between">
-                      <span className="text-muted-foreground">Discogs</span>
-                      <span className="font-medium tabular-nums">{current.discogsMatches.toLocaleString()}</span>
+                      <span className="text-muted-foreground">MB IDs captured</span>
+                      <span className="font-medium tabular-nums">{current.musicbrainzIdsCaptured.toLocaleString()}</span>
                     </div>
                     <div className="flex items-center justify-between">
-                      <span className="text-muted-foreground">Last.fm</span>
-                      <span className="font-medium tabular-nums">{current.lastfmMatches.toLocaleString()}</span>
+                      <span className="text-muted-foreground">Verified with MB</span>
+                      <span className="font-medium tabular-nums">{current.musicbrainzIdentityVerified.toLocaleString()}</span>
                     </div>
                     <div className="flex items-center justify-between">
-                      <span className="text-muted-foreground">Bandcamp</span>
-                      <span className="font-medium tabular-nums">{current.bandcampMatches.toLocaleString()}</span>
+                      <span className="text-muted-foreground">MB strict wins</span>
+                      <span className="font-medium tabular-nums">{current.musicbrainzStrictWins.toLocaleString()}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-muted-foreground">MB assisted non-wins</span>
+                      <span className="font-medium tabular-nums">{current.musicbrainzIdentityNonWins.toLocaleString()}</span>
                     </div>
                   </CardContent>
                 </Card>
               </div>
               <Card>
                 <CardHeader>
-                  <CardTitle className="text-sm">Metadata source share</CardTitle>
-                  <CardDescription>Distribution of album matches by provider.</CardDescription>
+                  <CardTitle className="text-sm">Strict winner provider share</CardTitle>
+                  <CardDescription>
+                    Distribution of final strict winner providers only. This is not the source of artist bios,
+                    album reviews, or merged enrichment payloads.
+                  </CardDescription>
                 </CardHeader>
                 <CardContent>
-                  <div className="h-[260px] flex items-center justify-center">
-                    <Doughnut data={metadataProvidersData} options={{ ...chartOptions, cutout: '60%' }} />
-                  </div>
+                  {strictWinnerProviderEntries.length > 0 ? (
+                    <div className="h-[260px] flex items-center justify-center">
+                      <Doughnut data={strictWinnerProviderData} options={{ ...chartOptions, cutout: '60%' }} />
+                    </div>
+                  ) : (
+                    <div className="h-[260px] flex items-center justify-center text-sm text-muted-foreground">
+                      No strict winner provider telemetry for the selected period yet.
+                    </div>
+                  )}
                 </CardContent>
               </Card>
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Provider tracklist misses</CardTitle>
+                    <CardDescription>
+                      Strict rejects where the surviving provider candidate did not expose a usable tracklist for verification.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <div className="text-3xl font-semibold tabular-nums">{current.providerNoTracklistTotal.toLocaleString()}</div>
+                    <div className="text-xs text-muted-foreground">
+                      PMDA distinguishes parser/API gaps from edition mismatches and true provider absence.
+                    </div>
+                    <div className="space-y-2">
+                      {providerNoTracklistByCauseEntries.length > 0 ? providerNoTracklistByCauseEntries.map(([cause, count]) => (
+                        <div key={cause} className="flex items-center justify-between text-sm">
+                          <span className="text-muted-foreground">{providerNoTracklistCauseLabels[cause] || cause}</span>
+                          <span className="font-medium tabular-nums">{Number(count || 0).toLocaleString()}</span>
+                        </div>
+                      )) : (
+                        <div className="text-sm text-muted-foreground">No provider tracklist misses recorded in the selected period.</div>
+                      )}
+                    </div>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Tracklist misses by provider</CardTitle>
+                    <CardDescription>
+                      Which provider family is failing to give PMDA a usable tracklist for strict verification.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-2">
+                    {providerNoTracklistByProviderEntries.length > 0 ? providerNoTracklistByProviderEntries.map(([provider, count]) => (
+                      <div key={provider} className="flex items-center justify-between gap-3 text-sm">
+                        <span className="text-muted-foreground capitalize">{provider}</span>
+                        <span className="font-medium tabular-nums">{Number(count || 0).toLocaleString()}</span>
+                      </div>
+                    )) : (
+                      <div className="text-sm text-muted-foreground">No provider-specific tracklist miss telemetry yet.</div>
+                    )}
+                  </CardContent>
+                </Card>
+              </div>
               <Card>
                 <CardHeader>
-                  <CardTitle className="text-sm">Metadata provider counts</CardTitle>
-                  <CardDescription>Absolute volume by provider (horizontal bars).</CardDescription>
+                  <CardTitle className="text-sm">MusicBrainz participation</CardTitle>
+                  <CardDescription>
+                    MusicBrainz can contribute IDs and verification without being the final strict winner provider.
+                  </CardDescription>
                 </CardHeader>
                 <CardContent>
-                  <div className="h-[260px]">
-                    <Bar
-                      data={metadataProvidersBarData}
-                      options={{
-                        ...chartOptions,
-                        indexAxis: 'y' as const,
-                        plugins: { ...chartOptions.plugins, legend: { display: false } },
-                        scales: {
-                          x: { beginAtZero: true },
-                          y: { beginAtZero: true },
-                        },
-                      }}
-                    />
-                  </div>
+                  {hasMusicbrainzParticipation ? (
+                    <div className="h-[260px]">
+                      <Bar
+                        data={musicbrainzParticipationData}
+                        options={{
+                          ...chartOptions,
+                          indexAxis: 'y' as const,
+                          plugins: { ...chartOptions.plugins, legend: { display: false } },
+                          scales: {
+                            x: { beginAtZero: true },
+                            y: { beginAtZero: true },
+                          },
+                        }}
+                      />
+                    </div>
+                  ) : (
+                    <div className="h-[260px] flex items-center justify-center text-sm text-muted-foreground">
+                      No MusicBrainz participation telemetry recorded in the selected period.
+                    </div>
+                  )}
                 </CardContent>
               </Card>
+              <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+                <Card className="xl:col-span-1">
+                  <CardHeader>
+                    <CardTitle className="text-sm">MusicBrainz outcomes</CardTitle>
+                    <CardDescription>
+                      Honest end states for MusicBrainz on each album: strict win, ID captured but non-winning, or no MB signal.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    {musicbrainzOutcomeEntries.length > 0 ? (
+                      <div className="h-[260px] flex items-center justify-center">
+                        <Doughnut data={musicbrainzOutcomeData} options={{ ...chartOptions, cutout: '60%' }} />
+                      </div>
+                    ) : (
+                      <div className="h-[260px] flex items-center justify-center text-sm text-muted-foreground">
+                        No MusicBrainz outcome telemetry recorded in the selected period.
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+                <Card className="xl:col-span-1">
+                  <CardHeader>
+                    <CardTitle className="text-sm">When another provider won</CardTitle>
+                    <CardDescription>
+                      Final strict winner provider on albums where MusicBrainz participated but did not finish the match.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-2">
+                    {musicbrainzNonWinWinnerEntries.length > 0 ? musicbrainzNonWinWinnerEntries.map(([provider, count]) => (
+                      <div key={provider} className="flex items-center justify-between gap-3 text-sm">
+                        <span className="text-muted-foreground">{providerDisplayLabel(provider)}</span>
+                        <span className="font-medium tabular-nums">{Number(count || 0).toLocaleString()}</span>
+                      </div>
+                    )) : (
+                      <div className="text-sm text-muted-foreground">
+                        No “other provider won” cases recorded with a captured MusicBrainz ID.
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+                <Card className="xl:col-span-1">
+                  <CardHeader>
+                    <CardTitle className="text-sm">Why MB did not finish winner</CardTitle>
+                    <CardDescription>
+                      Top reject reasons when a MusicBrainz ID was present but strict validation did not end on MusicBrainz.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-2">
+                    {musicbrainzNonWinReasonEntries.length > 0 ? musicbrainzNonWinReasonEntries.map(([reason, count]) => (
+                      <div key={reason} className="flex items-center justify-between gap-3 text-sm">
+                        <span className="text-muted-foreground">{musicbrainzReasonLabel(reason)}</span>
+                        <span className="font-medium tabular-nums">{Number(count || 0).toLocaleString()}</span>
+                      </div>
+                    )) : (
+                      <div className="text-sm text-muted-foreground">
+                        No MusicBrainz non-win reject reasons recorded in the selected period.
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              </div>
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Enrichment source share</CardTitle>
+                    <CardDescription>
+                      Library-wide distribution of useful enrichment payloads actually persisted from providers:
+                      album descriptions, artist bios, artist images, and label logos.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <div className="text-xs text-muted-foreground">
+                      {enrichmentOverallTotal > 0
+                        ? `${enrichmentOverallTotal.toLocaleString()} enrichment payloads cached`
+                        : 'No cached provider enrichment yet'}
+                    </div>
+                    <div className="h-[260px] flex items-center justify-center">
+                      <Doughnut data={enrichmentOverallData} options={{ ...chartOptions, cutout: '60%' }} />
+                    </div>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Enrichment breakdown</CardTitle>
+                    <CardDescription>
+                      Where PMDA is actually sourcing rich library data by category.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="h-[260px]">
+                      <Bar
+                        data={enrichmentBreakdownData}
+                        options={{
+                          ...chartOptions,
+                          plugins: { ...chartOptions.plugins, legend: { position: 'bottom' as const } },
+                          scales: {
+                            x: { stacked: true, beginAtZero: true },
+                            y: { stacked: true, beginAtZero: true },
+                          },
+                        }}
+                      />
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
             </TabsContent>
 
             <TabsContent value="ai" className="space-y-4">
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 2xl:grid-cols-4">
+                {aiOverviewDomains.map((domain) => {
+                  const queue = domain.queue;
+                  const benchmark = domain.benchmark;
+                  const queueState = queue?.running
+                    ? (queue.waiting_for_idle_scan ? 'Waiting for idle scan' : 'Running')
+                    : ((queue?.queued ?? 0) > 0 ? 'Queued' : 'Idle');
+                  return (
+                    <Card key={`ai-domain-${domain.domain}`}>
+                      <CardHeader className="pb-2">
+                        <CardTitle className="text-sm capitalize">{domain.domain}</CardTitle>
+                        <CardDescription>
+                          {domain.analysis_types.length > 0 ? domain.analysis_types.join(', ') : 'No mapped analysis types'}
+                        </CardDescription>
+                      </CardHeader>
+                      <CardContent className="space-y-3 text-xs">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-muted-foreground">Queue</span>
+                          <Badge variant={queue?.running ? 'default' : 'outline'}>{queueState}</Badge>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <div>
+                            <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Queued</p>
+                            <p className="text-sm font-semibold tabular-nums">{(queue?.queued ?? 0).toLocaleString()}</p>
+                          </div>
+                          <div>
+                            <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Avg latency</p>
+                            <p className="text-sm font-semibold tabular-nums">
+                              {domain.avg_latency_ms != null ? `${Math.round(domain.avg_latency_ms)} ms` : '—'}
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Calls</p>
+                            <p className="text-sm font-semibold tabular-nums">{domain.calls_total.toLocaleString()}</p>
+                          </div>
+                          <div>
+                            <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Overrides</p>
+                            <p className="text-sm font-semibold tabular-nums">
+                              {domain.override_rate != null
+                                ? `${domain.override_count.toLocaleString()} · ${domain.override_rate.toFixed(1)}%`
+                                : domain.override_count.toLocaleString()}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-3 gap-2 text-[11px]">
+                          <div className="rounded-md border border-border/70 bg-muted/20 px-2 py-1">
+                            completed {(domain.completed ?? 0).toLocaleString()}
+                          </div>
+                          <div className="rounded-md border border-border/70 bg-muted/20 px-2 py-1">
+                            skipped {(domain.skipped ?? 0).toLocaleString()}
+                          </div>
+                          <div className="rounded-md border border-border/70 bg-muted/20 px-2 py-1">
+                            failed {(domain.failed ?? 0).toLocaleString()}
+                          </div>
+                        </div>
+                        <div>
+                          <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Benchmark</p>
+                          {benchmark?.available ? (
+                            <p className="text-sm">
+                              baseline {(benchmark.baseline_score ?? 0).toFixed(2)} · assisted {(benchmark.assisted_score ?? 0).toFixed(2)}
+                              {' · '}
+                              <span className={Number(benchmark.delta ?? 0) >= 0 ? 'text-success' : 'text-destructive'}>
+                                {Number(benchmark.delta ?? 0) >= 0 ? '+' : ''}{(benchmark.delta ?? 0).toFixed(2)}
+                              </span>
+                            </p>
+                          ) : (
+                            <p className="text-sm text-muted-foreground">{benchmark?.note || 'No benchmark artifact yet'}</p>
+                          )}
+                        </div>
+                      </CardContent>
+                    </Card>
+                  );
+                })}
+              </div>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">AI domain overview</CardTitle>
+                  <CardDescription>
+                    Completed/skipped/failed calls, cache usage, benchmark deltas and human overrides by domain.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {aiOverviewDomains.length <= 0 ? (
+                    <p className="text-sm text-muted-foreground">No AI domain overview available yet.</p>
+                  ) : (
+                    <div className="border rounded-lg overflow-hidden">
+                      <div className="grid grid-cols-12 gap-2 px-3 py-2 text-[11px] uppercase tracking-wide text-muted-foreground bg-muted/30">
+                        <div className="col-span-2">Domain</div>
+                        <div className="col-span-1 text-right">Calls</div>
+                        <div className="col-span-1 text-right">Done</div>
+                        <div className="col-span-1 text-right">Skip</div>
+                        <div className="col-span-1 text-right">Fail</div>
+                        <div className="col-span-2 text-right">Avg latency</div>
+                        <div className="col-span-1 text-right">Cache</div>
+                        <div className="col-span-2 text-right">Benchmark</div>
+                        <div className="col-span-1 text-right">Override</div>
+                      </div>
+                      <div className="divide-y">
+                        {aiOverviewDomains.map((domain) => {
+                          const benchmark = domain.benchmark;
+                          return (
+                            <div key={`ai-overview-row-${domain.domain}`} className="grid grid-cols-12 gap-2 px-3 py-2 text-xs">
+                              <div className="col-span-2 capitalize">{domain.domain}</div>
+                              <div className="col-span-1 text-right tabular-nums">{domain.calls_total.toLocaleString()}</div>
+                              <div className="col-span-1 text-right tabular-nums">{domain.completed.toLocaleString()}</div>
+                              <div className="col-span-1 text-right tabular-nums">{domain.skipped.toLocaleString()}</div>
+                              <div className="col-span-1 text-right tabular-nums">{domain.failed.toLocaleString()}</div>
+                              <div className="col-span-2 text-right tabular-nums">
+                                {domain.avg_latency_ms != null ? `${Math.round(domain.avg_latency_ms)} ms` : '—'}
+                              </div>
+                              <div className="col-span-1 text-right tabular-nums">
+                                {domain.cache_hit_rate != null ? `${domain.cache_hit_rate.toFixed(1)}%` : '—'}
+                              </div>
+                              <div className="col-span-2 text-right tabular-nums">
+                                {benchmark?.available && benchmark.assisted_score != null && benchmark.baseline_score != null
+                                  ? `${benchmark.baseline_score.toFixed(2)} → ${benchmark.assisted_score.toFixed(2)}`
+                                  : '—'}
+                              </div>
+                              <div className="col-span-1 text-right tabular-nums">
+                                {domain.override_rate != null ? `${domain.override_rate.toFixed(1)}%` : '—'}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
               <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-card p-3">
                 <div>
                   <p className="text-sm font-medium">Cost scope</p>
@@ -1858,7 +2477,7 @@ export default function Statistics() {
                 />
                 <StatCard
                   title="Guardrail Blocks"
-                  icon={<AlertCircle className="w-4 h-4 text-red-500" />}
+                  icon={<AlertCircle className="w-4 h-4 text-destructive" />}
                   value={liveGuardCallsBlocked.toLocaleString()}
                   description={liveGuardLastReason || `Allowed this run: ${liveGuardCallsUsed.toLocaleString()}`}
                 />
@@ -2083,7 +2702,7 @@ export default function Statistics() {
                 />
                 <StatCard
                   title="Fully Complete"
-                  icon={<Sparkles className="w-4 h-4 text-emerald-500" />}
+                  icon={<Sparkles className="w-4 h-4 text-success" />}
                   value={`${current.fullyComplete.toLocaleString()} / ${current.albumsScanned.toLocaleString()}`}
                   description={formatPercent(current.fullyComplete, current.albumsScanned)}
                   delta={<DeltaPill current={current.fullyComplete} previous={previous.fullyComplete} />}
@@ -2170,7 +2789,7 @@ export default function Statistics() {
                 />
                 <StatCard
                   title="Best Score"
-                  icon={<Sparkles className="w-4 h-4 text-emerald-500" />}
+                  icon={<Sparkles className="w-4 h-4 text-success" />}
                   value={benchmarkReports.length > 0 ? `${benchmarkBestScore.toFixed(2)}%` : 'N/A'}
                 />
               </div>
@@ -2391,7 +3010,7 @@ export default function Statistics() {
                 />
                 <StatCard
                   title="Provider Lookup Cache"
-                  icon={<Database className="w-4 h-4 text-pink-500" />}
+                  icon={<Database className="w-4 h-4 text-primary" />}
                   value={n(cacheControl?.sqlite_cache_db?.provider_album_lookup_rows).toLocaleString()}
                   description={`${n(cacheControl?.sqlite_cache_db?.provider_album_lookup_not_found_rows).toLocaleString()} negative rows`}
                 />
@@ -2555,7 +3174,7 @@ export default function Statistics() {
               <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
                 <StatCard
                   title="Moved duplicates"
-                  icon={<Layers className="w-4 h-4 text-rose-400" />}
+                  icon={<Layers className="w-4 h-4 text-destructive" />}
                   value={duplicateMoves.length.toLocaleString()}
                   description={`Latest scan #${latestCompletedScanId ?? '—'}`}
                 />
@@ -2646,7 +3265,7 @@ export default function Statistics() {
               <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
                 <StatCard
                   title="Moved incompletes"
-                  icon={<AlertCircle className="w-4 h-4 text-orange-400" />}
+                  icon={<AlertCircle className="w-4 h-4 text-warning" />}
                   value={incompleteMoves.length.toLocaleString()}
                   description={`Latest scan #${latestCompletedScanId ?? '—'}`}
                 />

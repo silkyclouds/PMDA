@@ -282,18 +282,18 @@ export function AssistantDock({ bottomOffsetPx = 16 }: { bottomOffsetPx?: number
         size="icon"
         className={cn(
           'relative h-12 w-12 rounded-full border border-border/60',
-          'bg-background/85 backdrop-blur-md shadow-[0_10px_30px_rgba(0,0,0,0.2)]',
+          'bg-background/85 backdrop-blur-md shadow-md',
           'hover:scale-[1.02] transition'
         )}
         onClick={() => setOpen(true)}
         title={assistantOnline ? 'Open PMDA assistant' : offlineReason || 'Assistant unavailable'}
       >
         <MessageCircle className={cn('h-5 w-5', assistantOnline ? 'text-primary' : 'text-muted-foreground')} />
-        <Sparkles className={cn('absolute -bottom-1 -left-1 h-3.5 w-3.5', assistantOnline ? 'text-amber-400' : 'text-muted-foreground')} />
+        <Sparkles className={cn('absolute -bottom-1 -left-1 h-3.5 w-3.5', assistantOnline ? 'text-warning' : 'text-muted-foreground')} />
         <span
           className={cn(
             'absolute -top-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border border-background',
-            assistantOnline ? 'bg-emerald-500' : 'bg-zinc-500',
+            assistantOnline ? 'bg-success' : 'bg-muted-foreground',
           )}
         />
       </Button>

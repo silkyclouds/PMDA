@@ -98,7 +98,7 @@ export function AlbumArtworkGalleryDialog({
                     alt={`${albumTitle} ${selected.label}`}
                     size={1600}
                     priority
-                    imageClassName="h-full w-full object-contain bg-black/10"
+                    imageClassName="h-full w-full object-contain bg-muted/20"
                     fallbackClassName="flex h-full w-full items-center justify-center"
                   />
                 </div>

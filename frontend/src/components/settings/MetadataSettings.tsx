@@ -76,6 +76,7 @@ interface MetadataSettingsProps {
 export function MetadataSettings({ config, updateConfig, errors }: MetadataSettingsProps) {
   const [testingMB, setTestingMB] = useState(false);
   const [mbTestResult, setMbTestResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [coverBackfillRunning, setCoverBackfillRunning] = useState(false);
 
   const testMusicBrainz = async () => {
     if (!config.USE_MUSICBRAINZ) {
@@ -99,6 +100,22 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
       toast.error(message);
     } finally {
       setTestingMB(false);
+    }
+  };
+
+  const startCoverBackfill = async () => {
+    setCoverBackfillRunning(true);
+    try {
+      const result = await api.startFilesProfileBackfill({ reason: 'cover_only_manual', cover_only: true });
+      if (result.status === 'started') {
+        toast.success('Cover-only backfill started');
+      } else {
+        toast.message('Cover-only backfill is already running');
+      }
+    } catch (error: unknown) {
+      toast.error(error instanceof Error ? error.message : 'Failed to start cover-only backfill');
+    } finally {
+      setCoverBackfillRunning(false);
     }
   };
 
@@ -141,8 +158,8 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
               <div className="p-3 rounded-lg bg-muted/50 space-y-2">
                 <p className="text-sm font-medium">What does this do?</p>
                 <p className="text-xs text-muted-foreground">
-                  When enabled, PMDA queries MusicBrainz to enrich album metadata with release-group information, 
-                  helping to identify related releases (e.g., different editions, remasters, box sets). 
+                  When enabled, PMDA queries MusicBrainz to enrich album metadata with release-group information,
+                  helping to identify related releases (e.g., different editions, remasters, box sets).
                   This improves duplicate detection accuracy, especially for albums with multiple releases.
                 </p>
               </div>
@@ -150,9 +167,9 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
               <div className="p-3 rounded-lg bg-warning/5 border border-warning/20 space-y-2">
                 <p className="text-sm font-medium text-warning">Performance Impact</p>
                 <p className="text-xs text-muted-foreground">
-                  MusicBrainz lookups add network requests per album during scanning, which can slow down the process. 
-                  The impact depends on your library size and network latency. For large libraries (thousands of albums), 
-                  expect scanning to take significantly longer. Consider enabling this only if you need improved accuracy 
+                  MusicBrainz lookups add network requests per album during scanning, which can slow down the process.
+                  The impact depends on your library size and network latency. For large libraries (thousands of albums),
+                  expect scanning to take significantly longer. Consider enabling this only if you need improved accuracy
                   for complex duplicate scenarios.
                 </p>
               </div>
@@ -185,16 +202,16 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
                 </div>
                 {mbTestResult && (
                   <div className={`p-2 rounded-lg flex items-start gap-2 ${
-                    mbTestResult.success 
-                      ? 'bg-green-500/10 border border-green-500/20' 
-                      : 'bg-red-500/10 border border-red-500/20'
+                    mbTestResult.success
+                      ? 'bg-success/10 border border-success/20'
+                      : 'bg-destructive/10 border border-destructive/20'
                   }`}>
                     {mbTestResult.success ? (
-                      <CheckCircle2 className="w-4 h-4 text-green-500 mt-0.5 shrink-0" />
+                      <CheckCircle2 className="w-4 h-4 text-success mt-0.5 shrink-0" />
                     ) : (
-                      <XCircle className="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
+                      <XCircle className="w-4 h-4 text-destructive mt-0.5 shrink-0" />
                     )}
-                    <p className={`text-xs ${mbTestResult.success ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                    <p className={`text-xs ${mbTestResult.success ? 'text-success' : 'text-destructive'}`}>
                       {mbTestResult.message}
                     </p>
                   </div>
@@ -391,10 +408,10 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
                       }}
                     />
                   </div>
-                  <div className="p-3 rounded-lg bg-blue-500/5 border border-blue-500/20 space-y-2">
-                    <p className="text-sm font-medium text-blue-600 dark:text-blue-400">Contact Email (Optional)</p>
+                  <div className="p-3 rounded-lg bg-info/5 border border-info/20 space-y-2">
+                    <p className="text-sm font-medium text-info">Contact Email (Optional)</p>
                     <p className="text-xs text-muted-foreground">
-                      Your email address will be included in the User-Agent header sent to MusicBrainz. 
+                      Your email address will be included in the User-Agent header sent to MusicBrainz.
                       This helps MusicBrainz contact you if needed. Rate limit: 1 request per second (standard for all users).
                     </p>
                   </div>
@@ -600,6 +617,146 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
           )}
         </div>
 
+        {/* iTunes / Apple Music Section */}
+        <div className="space-y-4 p-4 rounded-lg border border-border">
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5 flex-1">
+              <div className="flex items-center gap-1.5">
+                <Label>Use iTunes / Apple Music</Label>
+                <FieldTooltip content="Enable Apple catalog cross-checks for extra album covers and commercial release confirmation. No key required." />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Extra no-auth fallback for covers and mainstream catalog cross-checks.
+              </p>
+            </div>
+            <Switch
+              checked={config.USE_ITUNES ?? true}
+              onCheckedChange={(checked) => updateConfig({ USE_ITUNES: checked })}
+            />
+          </div>
+
+          {config.USE_ITUNES !== false && (
+            <div className="p-3 rounded-lg bg-muted/50 space-y-2">
+              <p className="text-sm font-medium">No credentials required</p>
+              <p className="text-xs text-muted-foreground">
+                PMDA uses the public Apple catalog endpoints to cross-check album titles and recover missing cover art when stricter providers come up short.
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* Deezer Section */}
+        <div className="space-y-4 p-4 rounded-lg border border-border">
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5 flex-1">
+              <div className="flex items-center gap-1.5">
+                <Label>Use Deezer</Label>
+                <FieldTooltip content="Enable Deezer as an extra no-auth provider for album metadata, genres and cover fallbacks." />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Extra no-auth fallback for album metadata, genres and cover cross-checks.
+              </p>
+            </div>
+            <Switch
+              checked={config.USE_DEEZER ?? true}
+              onCheckedChange={(checked) => updateConfig({ USE_DEEZER: checked })}
+            />
+          </div>
+
+          {config.USE_DEEZER !== false && (
+            <div className="p-3 rounded-lg bg-muted/50 space-y-2">
+              <p className="text-sm font-medium">No credentials required</p>
+              <p className="text-xs text-muted-foreground">
+                Deezer adds one more searchable catalog for album, genre and artwork fallback without adding another account setup step.
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* Spotify Section */}
+        <div className="space-y-4 p-4 rounded-lg border border-border">
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5 flex-1">
+              <div className="flex items-center gap-1.5">
+                <Label>Use Spotify</Label>
+                <FieldTooltip content="Enable Spotify page metadata as an extra no-auth provider for album title, year and cover cross-checks." />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Extra no-auth fallback for album metadata and artwork recovery.
+              </p>
+            </div>
+            <Switch
+              checked={config.USE_SPOTIFY ?? true}
+              onCheckedChange={(checked) => updateConfig({ USE_SPOTIFY: checked })}
+            />
+          </div>
+
+          {config.USE_SPOTIFY !== false && (
+            <div className="p-3 rounded-lg bg-muted/50 space-y-2">
+              <p className="text-sm font-medium">No credentials required</p>
+              <p className="text-xs text-muted-foreground">
+                Spotify adds another public catalog source for release-year cross-checks and missing cover recovery without extra account setup.
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* Qobuz Section */}
+        <div className="space-y-4 p-4 rounded-lg border border-border">
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5 flex-1">
+              <div className="flex items-center gap-1.5">
+                <Label>Use Qobuz</Label>
+                <FieldTooltip content="Enable Qobuz page metadata as an extra no-auth provider for public store metadata and cover fallbacks." />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Extra no-auth fallback for store metadata, cover art and edition hints.
+              </p>
+            </div>
+            <Switch
+              checked={config.USE_QOBUZ ?? true}
+              onCheckedChange={(checked) => updateConfig({ USE_QOBUZ: checked })}
+            />
+          </div>
+
+          {config.USE_QOBUZ !== false && (
+            <div className="p-3 rounded-lg bg-muted/50 space-y-2">
+              <p className="text-sm font-medium">No credentials required</p>
+              <p className="text-xs text-muted-foreground">
+                Qobuz gives PMDA one more public metadata source when MusicBrainz, Discogs and streaming catalog fallbacks disagree or miss artwork.
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* TIDAL Section */}
+        <div className="space-y-4 p-4 rounded-lg border border-border">
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5 flex-1">
+              <div className="flex items-center gap-1.5">
+                <Label>Use TIDAL</Label>
+                <FieldTooltip content="Enable TIDAL page metadata as a best-effort no-auth provider for extra artwork and release cross-checks." />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Low-priority no-auth fallback for public metadata and missing cover art.
+              </p>
+            </div>
+            <Switch
+              checked={config.USE_TIDAL ?? true}
+              onCheckedChange={(checked) => updateConfig({ USE_TIDAL: checked })}
+            />
+          </div>
+
+          {config.USE_TIDAL !== false && (
+            <div className="p-3 rounded-lg bg-muted/50 space-y-2">
+              <p className="text-sm font-medium">No credentials required</p>
+              <p className="text-xs text-muted-foreground">
+                TIDAL stays behind the stronger providers, but it can still recover missing artwork or confirm basic release metadata.
+              </p>
+            </div>
+          )}
+        </div>
+
         {/* Last.fm Section */}
         <div className="space-y-4 p-4 rounded-lg border border-border">
           <div className="flex items-center justify-between">
@@ -687,11 +844,49 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
                   }}
                 />
               </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <Label htmlFor="theaudiodb-api-key">TheAudioDB API Key (optional)</Label>
+                  <FieldTooltip content="Optional: album cover and artist image fallback from TheAudioDB." />
+                  <a
+                    href="https://www.theaudiodb.com/api_apply.php"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-xs text-primary hover:underline inline-flex items-center gap-1"
+                  >
+                    Get API key <ExternalLink className="w-3 h-3" />
+                  </a>
+                </div>
+                <PasswordInput
+                  id="theaudiodb-api-key"
+                  placeholder="Your TheAudioDB API key"
+                  value={String(config.THEAUDIODB_API_KEY ?? '')}
+                  onChange={(e) => {
+                    updateConfig({ THEAUDIODB_API_KEY: e.target.value });
+                  }}
+                />
+              </div>
             </div>
           )}
         </div>
 
         {/* Bandcamp Section */}
+        <div className="space-y-4 p-4 rounded-lg border border-border">
+          <div className="flex items-start justify-between gap-4">
+            <div className="space-y-1">
+              <h4 className="font-medium text-sm">Cover backfill</h4>
+              <p className="text-xs text-muted-foreground">
+                Re-run artwork recovery only on the already indexed library without redoing artist bios or album reviews.
+              </p>
+            </div>
+            <Button type="button" variant="outline" size="sm" onClick={() => void startCoverBackfill()} disabled={coverBackfillRunning}>
+              {coverBackfillRunning ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              Run cover-only backfill
+            </Button>
+          </div>
+        </div>
+
         <div className="space-y-4 p-4 rounded-lg border border-border">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5 flex-1">
@@ -704,7 +899,7 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
               </p>
             </div>
             <Switch
-              checked={config.USE_BANDCAMP ?? false}
+              checked={config.USE_BANDCAMP ?? true}
               onCheckedChange={(checked) => updateConfig({ USE_BANDCAMP: checked })}
             />
           </div>

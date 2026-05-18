@@ -8,7 +8,7 @@ import { toast } from 'sonner';
 
 export function IncompleteResultsPanel() {
   const [loading, setLoading] = useState(false);
-  const [data, setData] = useState<{ run_id: number; items: api.IncompleteAlbumItem[] } | null>(null);
+  const [data, setData] = useState<{ run_id: number | null; items: api.IncompleteAlbumItem[] } | null>(null);
   const [moving, setMoving] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
@@ -16,12 +16,12 @@ export function IncompleteResultsPanel() {
     try {
       setLoading(true);
       const res = await api.getIncompleteAlbumsResults();
-      if (res.run_id != null && res.items.length > 0) {
+      if (res.items.length > 0) {
         setData({ run_id: res.run_id, items: res.items });
         setSelected(new Set());
       } else {
         setData(null);
-        toast.info('No incomplete scan results found. Run an "Incomplete albums only" scan first.');
+        toast.info('No incomplete album diagnostics found yet.');
       }
     } catch {
       toast.error('Failed to load incomplete scan results');
@@ -46,7 +46,7 @@ export function IncompleteResultsPanel() {
   };
 
   const handleMove = async () => {
-    if (!data || selected.size === 0) return;
+    if (!data || data.run_id == null || selected.size === 0) return;
     const items = data.items.filter((i) => selected.has(`${i.artist}|${i.album_id}`));
     try {
       setMoving(true);
@@ -62,7 +62,7 @@ export function IncompleteResultsPanel() {
   };
 
   const handleExport = (format: 'json' | 'csv') => {
-    if (!data) return;
+    if (!data || data.run_id == null) return;
     const url = api.getIncompleteAlbumsExportUrl(data.run_id, format);
     window.open(url, '_blank');
   };
@@ -70,7 +70,7 @@ export function IncompleteResultsPanel() {
   if (!data && !loading) {
     return (
       <div className="rounded-lg border border-border bg-card p-4">
-        <p className="text-sm text-muted-foreground mb-3">View and manage results from an &quot;Incomplete albums only&quot; scan.</p>
+        <p className="text-sm text-muted-foreground mb-3">View global incomplete album diagnostics collected across scans.</p>
         <Button variant="secondary" size="sm" onClick={loadResults} disabled={loading} className="gap-2">
           {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Music className="w-4 h-4" />}
           Load incomplete scan results
@@ -94,16 +94,18 @@ export function IncompleteResultsPanel() {
   return (
     <div className="rounded-lg border border-border bg-card overflow-hidden">
       <div className="px-4 py-3 border-b border-border flex flex-wrap items-center justify-between gap-2">
-        <h3 className="font-semibold text-foreground">Incomplete albums (run {data.run_id})</h3>
+        <h3 className="font-semibold text-foreground">
+          Incomplete albums {data.run_id != null ? `(run ${data.run_id})` : '(all scans)'}
+        </h3>
         <div className="flex items-center gap-2">
-          <Button size="sm" variant="secondary" onClick={handleMove} disabled={selected.size === 0 || moving} className="gap-1.5">
+          <Button size="sm" variant="secondary" onClick={handleMove} disabled={data.run_id == null || selected.size === 0 || moving} className="gap-1.5">
             {moving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FolderInput className="w-3.5 h-3.5" />}
             Move selected ({selected.size})
           </Button>
-          <Button size="sm" variant="outline" onClick={() => handleExport('json')} className="gap-1.5">
+          <Button size="sm" variant="outline" onClick={() => handleExport('json')} disabled={data.run_id == null} className="gap-1.5">
             <Download className="w-3.5 h-3.5" /> JSON
           </Button>
-          <Button size="sm" variant="outline" onClick={() => handleExport('csv')} className="gap-1.5">
+          <Button size="sm" variant="outline" onClick={() => handleExport('csv')} disabled={data.run_id == null} className="gap-1.5">
             <Download className="w-3.5 h-3.5" /> CSV
           </Button>
           <Button size="sm" variant="ghost" onClick={loadResults}>Refresh</Button>

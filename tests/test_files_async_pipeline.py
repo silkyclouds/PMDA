@@ -1,5 +1,6 @@
 import unittest
 import sqlite3
+from queue import Queue
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -7,6 +8,34 @@ import pmda
 
 
 class FilesAsyncPipelineTests(unittest.TestCase):
+    def test_wait_queue_idle_times_out_instead_of_blocking_forever(self):
+        q = Queue()
+        q.put("unfinished")
+
+        drained = pmda._wait_queue_idle(
+            q,
+            max_wait_sec=0.01,
+            label="unit-test queue",
+            poll_sec=0.001,
+        )
+
+        self.assertFalse(drained)
+
+    def test_wait_queue_idle_returns_true_when_queue_is_drained(self):
+        q = Queue()
+        q.put("finished")
+        q.get()
+        q.task_done()
+
+        drained = pmda._wait_queue_idle(
+            q,
+            max_wait_sec=0.01,
+            label="unit-test queue",
+            poll_sec=0.001,
+        )
+
+        self.assertTrue(drained)
+
     def test_files_source_roots_fetch_returns_rows(self):
         with TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "state.db"
@@ -98,7 +127,7 @@ class FilesAsyncPipelineTests(unittest.TestCase):
             def _should_not_run(_albums):
                 calls["improve"] += 1
 
-            def _fake_backfill(*, reason="manual", sleep_sec=0.0):
+            def _fake_backfill(*, reason="manual", sleep_sec=0.0, **_kwargs):
                 calls["backfill"] += 1
                 with pmda._files_profile_backfill_lock:
                     pmda._files_profile_backfill_state.update(
