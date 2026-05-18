@@ -8,6 +8,11 @@ RUN npm install
 COPY frontend/ ./
 RUN npm run build
 
+# ─── Stage 1b: Node runtime for Codex CLI ─────────────────────────────────────
+# Copy Node/npm from a slim glibc image instead of installing Debian's npm
+# dependency tree in the Python runtime stage.
+FROM node:20-bookworm-slim AS node-runtime
+
 # ─── Stage 2: PMDA backend + integrated frontend ─────────────────────────────
 FROM python:3.11-slim
 ARG TARGETARCH
@@ -33,11 +38,8 @@ RUN mkdir -p /etc/postgresql-common && \
     apt-get install -y --no-install-recommends \
       git \
       curl \
-	      ffmpeg \
-	      git \
-	      nodejs \
-	      npm \
-	      sqlite3 \
+      ffmpeg \
+      sqlite3 \
       docker-cli \
       docker-compose \
       libchromaprint-tools \
@@ -102,6 +104,10 @@ WORKDIR /app
 COPY . /app
 # Override frontend dist with the built assets from stage 1
 COPY --from=frontend-build /fe/dist /app/frontend/dist
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
 RUN pip install --no-cache-dir -r requirements.txt
 RUN npm install -g @openai/codex
