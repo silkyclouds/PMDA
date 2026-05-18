@@ -194,30 +194,6 @@ export default function Settings() {
     window.dispatchEvent(new CustomEvent("pmda:open-guided-onboarding"));
   }, []);
 
-  const refreshManagedRuntimeStatus = useCallback(
-    async (options?: { quiet?: boolean }) => {
-      setManagedRuntimeLoading(true);
-      try {
-        const status = await api.getManagedRuntimeStatus();
-        setManagedRuntimeStatus(status);
-        return status;
-      } catch (e) {
-        if (!options?.quiet) {
-          toast.error(
-            getApiErrorMessage(e) ||
-              (e instanceof Error
-                ? e.message
-                : "Failed to load local stack status"),
-          );
-        }
-        return null;
-      } finally {
-        setManagedRuntimeLoading(false);
-      }
-    },
-    [getApiErrorMessage],
-  );
-
   const refreshProviderStatus = useCallback(async () => {
     setProvidersChecking(true);
     try {
@@ -359,34 +335,6 @@ export default function Settings() {
             </Button>
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          {lastSaved === true && (
-            <span className="text-sm font-medium text-success flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-success/10">
-              <Check className="w-4 h-4" /> Saved
-            </span>
-          )}
-          <Button
-            onClick={saveConfig}
-            disabled={isSaving}
-            variant="outline"
-            size="sm"
-            className="gap-2"
-          >
-            {isSaving ? (
-              <>
-                <Loader2 className="w-4 h-4 animate-spin" />
-                Saving...
-              </>
-            ) : (
-              <>
-                <Save className="w-4 h-4" />
-                Save all now
-              </>
-            )}
-          </Button>
-        </div>
-      </div>
-
         <SettingsControlPlane
           config={config}
           providersPreflight={providersPreflight}

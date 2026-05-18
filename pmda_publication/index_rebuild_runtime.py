@@ -44,12 +44,14 @@ def rebuild_files_library_index_for_runtime(
     runtime: Any,
     reason: str = "manual",
     wait_if_running: bool = False,
+    filesystem_roots_override: list[str] | None = None,
 ):
     """Run a full Files index rebuild using the live PMDA runtime."""
     _bind_runtime(runtime)
     return _rebuild_files_library_index_impl(
         reason=reason,
         wait_if_running=wait_if_running,
+        filesystem_roots_override=filesystem_roots_override,
     )
 
 
@@ -701,10 +703,19 @@ def _rebuild_files_library_index_for_artist_impl(
     finally:
         files_index_lock.release()
 
-def _rebuild_files_library_index_impl(reason: str = "manual", wait_if_running: bool = False) -> dict:
+def _rebuild_files_library_index_impl(
+    reason: str = "manual",
+    wait_if_running: bool = False,
+    filesystem_roots_override: list[str] | None = None,
+) -> dict:
     if _get_library_mode() != "files":
         return {"ok": False, "error": "LIBRARY_MODE is not 'files'"}
-    if not FILES_ROOTS:
+    filesystem_roots = [
+        str(root or "").strip()
+        for root in (filesystem_roots_override or FILES_ROOTS or [])
+        if str(root or "").strip()
+    ]
+    if not filesystem_roots:
         return {"ok": False, "error": "FILES_ROOTS is empty"}
     if not _files_pg_init_schema():
         return {"ok": False, "error": "PostgreSQL schema unavailable"}
@@ -776,7 +787,7 @@ def _rebuild_files_library_index_impl(reason: str = "manual", wait_if_running: b
             "Files library index rebuild starting (%s): source=%s roots=%s force_filesystem=%s force_reason=%s published_rows=%s scan_running=%s",
             reason,
             payload_source,
-            list(FILES_ROOTS or []),
+            list(filesystem_roots or []),
             bool(force_filesystem_source),
             force_reason or "-",
             int(published_count or 0),
@@ -858,7 +869,7 @@ def _rebuild_files_library_index_impl(reason: str = "manual", wait_if_running: b
                             "source": payload_source,
                             "entries_scanned": int(payload.get("entries_scanned") or 0),
                             "roots_done": int(payload.get("roots_done") or 0),
-                            "roots_total": int(payload.get("roots_total") or len(FILES_ROOTS or [])),
+                            "roots_total": int(payload.get("roots_total") or len(filesystem_roots or [])),
                         },
                     )
                     logging.info(
@@ -866,7 +877,7 @@ def _rebuild_files_library_index_impl(reason: str = "manual", wait_if_running: b
                         payload_source,
                         str(payload.get("root") or ""),
                         int(payload.get("roots_done") or 0),
-                        int(payload.get("roots_total") or len(FILES_ROOTS or [])),
+                        int(payload.get("roots_total") or len(filesystem_roots or [])),
                         int(payload.get("entries_scanned") or 0),
                         audio_found,
                         folders_found,
@@ -876,7 +887,7 @@ def _rebuild_files_library_index_impl(reason: str = "manual", wait_if_running: b
                     last_group_log["folders"] = folders_found
 
             by_folder = _group_audio_files_by_folder_under_roots(
-                FILES_ROOTS,
+                filesystem_roots,
                 progress_cb=_on_group_progress,
                 progress_every=500,
                 heartbeat_seconds=10.0,

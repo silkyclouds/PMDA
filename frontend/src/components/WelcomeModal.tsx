@@ -65,6 +65,11 @@ export function WelcomeModal({ onClose, config, mode = 'welcome', onOpenGuidedOn
     onClose();
   };
 
+  const goToScan = () => {
+    onClose();
+    navigate('/scan');
+  };
+
   return (
     <>
       <div

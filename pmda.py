@@ -36,7 +36,6 @@ import os
 import secrets
 import shutil
 import uuid
-import itertools
 import ipaddress
 import tempfile
 import filecmp
@@ -5654,35 +5653,6 @@ def _files_pg_is_connection_dropped_error(exc: Any) -> bool:
     return _files_pg_runtime.files_pg_is_connection_dropped_error(exc)
 
 
-def _files_pg_error_text(exc: Any) -> str:
-    try:
-        return " ".join(str(exc or "").split()).strip().lower()
-    except Exception:
-        return ""
-
-
-def _files_pg_is_connection_dropped_error(exc: Any) -> bool:
-    if exc is None:
-        return False
-    cls_name = str(getattr(exc.__class__, "__name__", "") or "").strip().lower()
-    text = _files_pg_error_text(exc)
-    markers = (
-        "server closed the connection unexpectedly",
-        "terminating connection due to",
-        "consuming input failed",
-        "connection is closed",
-        "connection already closed",
-        "broken pipe",
-        "connection reset by peer",
-        "admin shutdown",
-    )
-    if any(marker in text for marker in markers):
-        return True
-    return cls_name in {"operationalerror", "interfaceerror"} and (
-        "connection" in text or "server" in text or "input failed" in text
-    )
-
-
 @contextmanager
 def _files_pg_connection(*, autocommit: bool = True):
     with _files_pg_runtime.files_pg_connection_for_runtime(sys.modules[__name__], autocommit=autocommit) as conn:
@@ -7419,11 +7389,16 @@ def _files_index_payload_source_decision(
     return use_published_payload, payload_source, force_filesystem_source, force_reason
 
 
-def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool = False) -> dict:
+def _rebuild_files_library_index(
+    reason: str = "manual",
+    wait_if_running: bool = False,
+    filesystem_roots_override: list[str] | None = None,
+) -> dict:
     return _index_rebuild_runtime.rebuild_files_library_index_for_runtime(
         sys.modules[__name__],
         reason=reason,
         wait_if_running=wait_if_running,
+        filesystem_roots_override=filesystem_roots_override,
     )
 
 
@@ -10420,100 +10395,6 @@ def _iter_audio_files_under_roots(*args: Any, **kwargs: Any) -> Any:
 
 def _group_audio_files_by_folder_under_roots(*args: Any, **kwargs: Any) -> Any:
     return _audio_runtime._group_audio_files_by_folder_under_roots_for_runtime(sys.modules[__name__], *args, **kwargs)
-
-
-def _group_audio_files_by_folder_under_roots(
-    roots: list[str],
-    *,
-    progress_cb=None,
-    progress_every: int = 250,
-    heartbeat_seconds: float = 10.0,
-) -> dict[Path, list[Path]]:
-    """
-    Walk roots once and group discovered audio files directly by album folder.
-
-    This avoids the rebuild path's previous "collect every audio file first, then regroup"
-    pattern, which is unnecessarily expensive on large Unraid/FUSE shares such as a
-    pre-existing serving library.
-    """
-    roots_list = [str(r) for r in (roots or []) if r]
-    roots_total = len(roots_list)
-    if roots_total <= 0:
-        return {}
-
-    progress_every = max(1, int(progress_every)) if progress_every else 0
-    heartbeat_seconds = float(heartbeat_seconds or 0.0)
-    progress_enabled = callable(progress_cb)
-
-    by_folder: dict[Path, list[Path]] = defaultdict(list)
-    seen_paths: set[str] = set()
-    entries_scanned = 0
-    files_found = 0
-    folders_with_audio = 0
-    roots_done = 0
-    last_heartbeat = time.monotonic()
-
-    def _emit_progress(*, root: str, force: bool = False) -> None:
-        nonlocal last_heartbeat
-        if not progress_enabled:
-            return
-        if not force and heartbeat_seconds > 0:
-            now = time.monotonic()
-            if (now - last_heartbeat) < heartbeat_seconds:
-                return
-            last_heartbeat = now
-        try:
-            progress_cb(
-                {
-                    "root": root,
-                    "roots_done": roots_done,
-                    "roots_total": roots_total,
-                    "entries_scanned": entries_scanned,
-                    "files_found": files_found,
-                    "folders_found": folders_with_audio,
-                }
-            )
-        except Exception:
-            pass
-
-    for root_path in roots_list:
-        base = Path(root_path)
-        if not base.exists():
-            roots_done += 1
-            _emit_progress(root=str(base), force=True)
-            continue
-        stack: list[str] = [str(base)]
-        while stack:
-            current = stack.pop()
-            try:
-                with os.scandir(current) as it:
-                    for entry in it:
-                        entries_scanned += 1
-                        try:
-                            if entry.is_dir(follow_symlinks=False):
-                                stack.append(entry.path)
-                            elif entry.is_file(follow_symlinks=False) and AUDIO_RE.search(entry.name):
-                                p = Path(entry.path)
-                                sp = str(p)
-                                if sp in seen_paths:
-                                    continue
-                                seen_paths.add(sp)
-                                parent = p.parent
-                                if parent not in by_folder:
-                                    folders_with_audio += 1
-                                by_folder[parent].append(p)
-                                files_found += 1
-                                if progress_every > 0 and (files_found % progress_every == 0):
-                                    _emit_progress(root=str(base), force=True)
-                        except (OSError, PermissionError):
-                            continue
-                        _emit_progress(root=str(base), force=False)
-            except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
-                continue
-        roots_done += 1
-        _emit_progress(root=str(base), force=True)
-
-    return by_folder
 
 
 def _iter_audio_files_under_roots_checkpointed(
@@ -18756,259 +18637,6 @@ def _folder_has_release_segment_children(*args: Any, **kwargs: Any) -> Any:
 
 def _collapse_nested_album_folder_groups(*args: Any, **kwargs: Any) -> Any:
     return _audio_runtime._collapse_nested_album_folder_groups_for_runtime(sys.modules[__name__], *args, **kwargs)
-
-
-
-def _files_child_folder_name_looks_release_segment(name: str) -> bool:
-    txt = str(name or "").strip()
-    if not txt:
-        return False
-    norm = _normalize_identity_text_strict(txt)
-    if not norm:
-        return False
-    if re.match(r"^(?:cd|disc|disk|part|pt|act|scene|movement|mvmt|side|volume|vol|book)\b", norm):
-        return True
-    if re.match(r"^(?:disc|cd)?\s*\d{1,2}$", norm):
-        return True
-    if re.match(r"^[a-d]$", norm):
-        return True
-    return bool(
-        re.search(
-            r"\b(?:symphony|concerto|sonata|suite|requiem|mass|quartet|quintet|trio|prelude|fugue|overture|movement|act|scene)\b",
-            norm,
-        )
-    )
-
-
-def _folder_release_segment_child_dirs(folder_path: Path, audio_files: list[Path] | None) -> list[Path]:
-    """
-    Return immediate child directories that look like work/disc segments under `folder_path`.
-    """
-    folder = Path(folder_path)
-    child_dirs: dict[str, Path] = {}
-    direct_audio_present = False
-    for raw_path in audio_files or []:
-        try:
-            p = Path(raw_path)
-            rel = p.relative_to(folder)
-        except Exception:
-            continue
-        parts = list(rel.parts)
-        if len(parts) <= 1:
-            direct_audio_present = True
-            continue
-        child = folder / parts[0]
-        child_dirs[str(child)] = child
-    if direct_audio_present or len(child_dirs) < 2:
-        return []
-    segment_children = [child for child in child_dirs.values() if _files_child_folder_name_looks_release_segment(child.name)]
-    if len(segment_children) < 2:
-        return []
-    if len(segment_children) != len(child_dirs):
-        return []
-    return sorted(segment_children, key=lambda p: str(p).lower())
-
-
-def _folder_has_release_segment_children(folder_path: Path, audio_files: list[Path] | None) -> bool:
-    return len(_folder_release_segment_child_dirs(folder_path, audio_files)) >= 2
-
-
-def _collapse_nested_album_folder_groups(
-    by_folder: dict[Path, list[Path]],
-    *,
-    root_dirs: Optional[set[str]] = None,
-    progress_cb: Optional[Callable[[dict[str, Any]], None]] = None,
-) -> dict[Path, list[Path]]:
-    """
-    Collapse child work/disc folders into one parent album folder when they clearly belong
-    to the same release.
-
-    This fixes structures like:
-      Album Root/
-        Symphony No32/
-        Symphony No35/
-        Symphony No38/
-
-    or:
-      Album Root/
-        Disc 1/
-        Disc 2/
-
-    without collapsing normal artist folders that merely contain different albums.
-    """
-    if not by_folder:
-        return by_folder
-
-    def _normalize_child_entry(
-        entry: Any,
-    ) -> tuple[Path, list[Path], dict[str, Any]] | None:
-        if not isinstance(entry, (tuple, list)):
-            return None
-        if len(entry) == 2:
-            child_raw, paths_raw = entry
-            tags_raw: Any = {}
-        elif len(entry) >= 3:
-            child_raw, paths_raw, tags_raw = entry[:3]
-        else:
-            return None
-        try:
-            child_path = Path(child_raw)
-        except Exception:
-            return None
-        ordered_paths = [Path(p) for p in (paths_raw or [])]
-        tags_dict = tags_raw if isinstance(tags_raw, dict) else {}
-        return (child_path, ordered_paths, tags_dict)
-
-    roots = root_dirs if isinstance(root_dirs, set) else _files_root_dir_strings()
-    collapsed = dict(by_folder)
-    parent_children: dict[Path, list[tuple[Path, list[Path]]]] = defaultdict(list)
-    for folder, paths in by_folder.items():
-        folder_key = Path(folder)
-        parent = folder_key.parent
-        if not parent or parent == folder_key:
-            continue
-        if _files_is_files_root_dir(parent, root_dirs=roots):
-            continue
-        try:
-            resolved_parent = folder_key.resolve().parent
-        except Exception:
-            resolved_parent = None
-        if resolved_parent and resolved_parent != parent and _files_is_files_root_dir(
-            resolved_parent,
-            root_dirs=roots,
-        ):
-            continue
-        parent_children[parent].append((folder_key, paths or []))
-
-    cover_names = {name.lower() for name in _COVER_NAMES}
-    total_parents = len(parent_children)
-    collapsed_groups = 0
-    for idx, (parent, children) in enumerate(parent_children.items(), start=1):
-        if progress_cb and (idx == 1 or idx % 200 == 0):
-            try:
-                progress_cb(
-                    {
-                        "phase": "collapsing",
-                        "parent": str(parent),
-                        "parents_processed": idx,
-                        "parents_total": total_parents,
-                        "collapsed_groups": collapsed_groups,
-                    }
-                )
-            except Exception:
-                pass
-        if len(children) < 2:
-            continue
-        parent_has_cover = False
-        try:
-            parent_has_cover = any(
-                p.is_file() and p.name.lower() in cover_names
-                for p in parent.iterdir()
-            )
-        except Exception:
-            parent_has_cover = False
-        if parent in by_folder:
-            # Parent already contains direct audio; keep the explicit grouping.
-            continue
-
-        prepared_children: list[tuple[Path, list[Path], dict[str, Any], str, str]] = []
-        identity_groups: dict[tuple[str, str], list[tuple[Path, list[Path], dict[str, Any]]]] = defaultdict(list)
-        for raw_child in children:
-            normalized_child = _normalize_child_entry(raw_child)
-            if not normalized_child:
-                continue
-            child, ordered, existing_tags = normalized_child
-            if not ordered:
-                continue
-            try:
-                first_tags = existing_tags or extract_tags(ordered[0]) or {}
-            except Exception:
-                first_tags = {}
-            first_tags = first_tags if isinstance(first_tags, dict) else {}
-            album_title = _sanitize_album_title_display(
-                _pick_album_title_from_tag_dicts([first_tags], fallback="")
-            )
-            artist_name = _pick_album_artist_from_tag_dicts([first_tags], default="")
-            album_norm = (
-                norm_album_for_dedup(album_title, normalize_parenthetical=True)
-                if album_title
-                else ""
-            )
-            artist_norm = _norm_artist_key(artist_name) if artist_name else ""
-            prepared_children.append((child, ordered, first_tags, album_norm, artist_norm))
-            if album_norm:
-                identity_groups[(album_norm, artist_norm)].append((child, ordered, first_tags))
-
-        qualifying = [(key, items) for key, items in identity_groups.items() if len(items) >= 2]
-        items: list[tuple[Path, list[Path], dict[str, Any]]] | None = None
-        if len(qualifying) == 1:
-            (_album_norm, _artist_norm), items = qualifying[0]
-        else:
-            if not parent_has_cover:
-                continue
-            segment_items: list[tuple[Path, list[Path], dict[str, Any]]] = []
-            for child, ordered, child_tags, _album_norm, _artist_norm in prepared_children:
-                if not _files_child_folder_name_looks_release_segment(child.name):
-                    continue
-                segment_items.append((child, ordered, child_tags))
-            if len(segment_items) < 2 or len(segment_items) != len(prepared_children):
-                continue
-            contributor_keys: set[str] = set()
-            for _child, _ordered, tags in segment_items:
-                contributor = (
-                    str(tags.get("albumartist") or tags.get("artist") or tags.get("composer") or "").strip()
-                )
-                contributor_norm = _norm_artist_key(contributor)
-                if contributor_norm:
-                    contributor_keys.add(contributor_norm)
-            if len(contributor_keys) > 1:
-                continue
-            items = segment_items
-
-        if not items:
-            continue
-
-        segment_votes = sum(
-            1 for child, _paths, _tags in items if _files_child_folder_name_looks_release_segment(child.name)
-        )
-        if segment_votes < max(1, len(items) // 2) and not parent_has_cover:
-            continue
-
-        combined_paths: list[Path] = []
-        seen_paths: set[str] = set()
-        for child, ordered, _tags in items:
-            for path in ordered:
-                key = str(path)
-                if key in seen_paths:
-                    continue
-                seen_paths.add(key)
-                combined_paths.append(path)
-        if len(combined_paths) <= max(len(items), 1):
-            continue
-
-        for child, _ordered, _tags in items:
-            collapsed.pop(child, None)
-        collapsed[parent] = sorted(combined_paths, key=lambda p: str(p))
-        collapsed_groups += 1
-        if progress_cb:
-            try:
-                progress_cb(
-                    {
-                        "phase": "collapsing",
-                        "parent": str(parent),
-                        "parents_processed": idx,
-                        "parents_total": total_parents,
-                        "collapsed_groups": collapsed_groups,
-                    }
-                )
-            except Exception:
-                pass
-        logging.info(
-            "FILES discovery: collapsed %d child album folder(s) into parent release folder %s",
-            len(items),
-            parent,
-        )
-    return collapsed
 
 
 def _improve_folder_by_path(folder_path: Path) -> dict:

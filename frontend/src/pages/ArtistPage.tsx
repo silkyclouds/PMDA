@@ -190,6 +190,7 @@ export default function ArtistPage() {
   const { toast } = useToast();
   const autoAiRequestedRef = useRef(false);
   const similarWarmupArtistIdRef = useRef<number | null>(null);
+  const autoMissingDataRefreshArtistIdRef = useRef<number | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [details, setDetails] = useState<ArtistDetailResponse | null>(null);

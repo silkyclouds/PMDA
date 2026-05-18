@@ -939,8 +939,6 @@ export interface PMDAConfig {
   SCAN_AI_EFFECTIVE_BATCH?: string;
   /** Effective web-search layer for the scan pipeline. */
   SCAN_AI_EFFECTIVE_WEB_SEARCH?: string;
-  /** Allow AI arbitration while comparing provider identity candidates. */
-  PROVIDER_IDENTITY_USE_AI?: boolean;
   OPENAI_API_KEY: string;
   OPENAI_API_KEY_SET?: boolean;
   OPENAI_ENABLE_API_KEY_MODE?: boolean;
@@ -2350,6 +2348,9 @@ export interface LibraryAlbumItem {
   public_rating_source?: string | null;
   heat_score?: number | null;
   classical?: ClassicalIdentityPayload | null;
+  is_box_set?: boolean;
+  box_set_disc_count?: number | null;
+  box_set_member_album_ids?: number[] | null;
   publication_state?: 'published' | 'enriching' | 'ready' | string | null;
   cover_state?: 'ready' | 'enriching' | 'missing' | 'fallback' | string | null;
   artist_media_state?: 'ready' | 'enriching' | 'missing' | string | null;

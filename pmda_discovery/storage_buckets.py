@@ -177,7 +177,7 @@ def build_unraid_scan_roots(
     return roots, entries
 
 
-_ENTRY_LOOKUP_CACHE: OrderedDict[tuple[int, int], dict[str, Any]] = OrderedDict()
+_ENTRY_LOOKUP_CACHE: OrderedDict[tuple[tuple[str, str, str], ...], dict[str, Any]] = OrderedDict()
 
 
 def rel_text(path: Path | str | None, root: Path | str | None) -> str | None:
@@ -200,7 +200,14 @@ def entry_lookup_tables(entries: list[dict[str, Any]] | tuple[dict[str, Any], ..
 
     if not entries:
         return {"by_device": {}, "access_roots": []}
-    cache_key = (id(entries), len(entries))
+    cache_key = tuple(
+        (
+            str((entry or {}).get("storage_device_id") or "").strip(),
+            str((entry or {}).get("access_root") or "").strip().rstrip("/"),
+            str((entry or {}).get("canonical_root") or "").strip().rstrip("/"),
+        )
+        for entry in entries
+    )
     cached = _ENTRY_LOOKUP_CACHE.get(cache_key)
     if cached is not None:
         _ENTRY_LOOKUP_CACHE.move_to_end(cache_key)
