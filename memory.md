@@ -3540,6 +3540,8 @@
     - `backup/refactor-before-origin-main-merge-20260518-154052`
   - Current reconciliation branch pushed to GitHub:
     - `silk/pmda-refactor-on-latest-20260518`
+  - Explicit `origin/main` safety backup created before any main update:
+    - `backup/origin-main-before-reconciled-refactor-20260518-183246`
   - Key commits on this branch:
     - `8d76084` Reconcile runtime refactor with latest main
     - `49a6511` Fix runtime image Codex CLI install
