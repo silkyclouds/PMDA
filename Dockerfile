@@ -33,9 +33,11 @@ RUN mkdir -p /etc/postgresql-common && \
     apt-get install -y --no-install-recommends \
       git \
       curl \
-      ffmpeg \
-      git \
-      sqlite3 \
+	      ffmpeg \
+	      git \
+	      nodejs \
+	      npm \
+	      sqlite3 \
       docker-cli \
       docker-compose \
       libchromaprint-tools \
