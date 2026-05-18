@@ -3527,3 +3527,64 @@
     - `docker rm PMDA`
     - `docker rename PMDA_pre_runtime_refactor_20260518-153543 PMDA`
     - `docker start PMDA`
+
+## 2026-05-18 Reconciliation Checkpoint: Refactor Rebased Onto Current `origin/main`
+
+- Context:
+  - The first runtime-refactor deployment was built from the refactor lineage before it was reconciled with the newest `origin/main`. This risked missing newer PMDA features and was replaced.
+  - Work stopped on the deployed refactor branch, then a reconciliation branch was created: `silk/pmda-refactor-on-latest-20260518`.
+  - The branch now contains the latest `origin/main` plus the runtime extraction/refactor work.
+- GitHub safety:
+  - Previous safety branches remain:
+    - `backup/pre-refactor-publish-20260518-152628`
+    - `backup/refactor-before-origin-main-merge-20260518-154052`
+  - Current reconciliation branch pushed to GitHub:
+    - `silk/pmda-refactor-on-latest-20260518`
+  - Key commits on this branch:
+    - `8d76084` Reconcile runtime refactor with latest main
+    - `49a6511` Fix runtime image Codex CLI install
+    - `df337d7` Use slim Node runtime for Codex CLI
+- Validation before deploy:
+  - Full backend suite passed: `732 passed, 3 warnings, 7 subtests passed`.
+  - Frontend production build passed: `npm run build`.
+  - Static gates passed:
+    - `python3 scripts/pipeline_audit_gate.py`
+    - `python3 scripts/legacy_cleanup_gate.py`
+    - `python3 scripts/pmda_bootstrap_gate.py`
+  - `git diff --check` passed.
+  - `pmda.py` bootstrap gate state: `19,136` lines with no direct Flask routes.
+- Docker publication:
+  - Built with `scripts/build_with_classical_gate.sh --with-latest`.
+  - Pushed both `meaning/pmda:beta` and `meaning/pmda:latest`.
+  - Published digest for both tags:
+    - `meaning/pmda@sha256:efddf956c60dad43572823e0a02d0a3ac7e3416d9d77110666ecfd4aedd36fe9`
+  - The Dockerfile now copies Node from `node:20-bookworm-slim` and recreates npm/npx symlinks, avoiding the much heavier Debian `nodejs/npm` package tree while keeping `@openai/codex` available for PMDA's Codex CLI runtime.
+- Unraid deployment:
+  - Recreated the Unraid `PMDA` container from `meaning/pmda:latest`.
+  - Preserved the previous live container as:
+    - `PMDA_pre_reconciled_refactor_20260518-182638`
+  - Inspect backup:
+    - `/mnt/cache/appdata/PMDA/pmda-deploy-inspect-20260518-182638.json`
+  - Rollback script:
+    - `/mnt/cache/appdata/PMDA/pmda-rollback-20260518-182638.sh`
+  - Confirmed deployed image digest:
+    - `meaning/pmda@sha256:efddf956c60dad43572823e0a02d0a3ac7e3416d9d77110666ecfd4aedd36fe9`
+- Unraid smoke validation:
+  - Container is running and boot logs show files mode active, Plex DB source checks skipped, Ollama verified, watcher manager started, MusicBrainz queue initialized, and files index ready.
+  - Error scan after deploy found no `Traceback`, `Killed`, `statement timeout`, `OperationalError`, `RuntimeError`, `Exception`, or segmentation fault.
+  - Authenticated API smoke:
+    - `/api/progress`: `200` in `0.129s`, `exports_so_far=65708`, `has_completed_full_scan=True`.
+    - `/api/jobs/status`: `200` in `0.155s`.
+    - `/api/library/files-index/status`: `200` in `0.007s`, `indexed_albums=65708`, `indexed_artists=49010`, `indexed_tracks=627512`.
+    - `/api/library/albums?sort=recent&limit=96&offset=0&include_unmatched=1&scope=library`: `200` in `3.10s`, `96` albums.
+    - `/api/library/artists?sort=alpha&limit=120&offset=0&include_unmatched=1&scope=library`: `200` in `0.585s`, `120` artists.
+    - `/api/runtime/managed/status?skip_candidates=true`: `200` in `0.107s`.
+    - Full `/api/runtime/managed/status` is still intentionally heavier at `18.2s`; UI polling should continue using `skip_candidates=true`.
+- Rollback:
+  - If this reconciled image misbehaves on Unraid:
+    - `docker stop PMDA`
+    - `docker rm PMDA`
+    - `docker rename PMDA_pre_reconciled_refactor_20260518-182638 PMDA`
+    - `docker start PMDA`
+  - Or run:
+    - `/mnt/cache/appdata/PMDA/pmda-rollback-20260518-182638.sh`
